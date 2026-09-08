@@ -118,7 +118,16 @@ static int OHOS_UpdateWindowFramebuffer(_THIS, SDL_Window *window,
 	{
 		return 0;
 	}
-	native_window = (OHNativeWindow *)SDL_OHOS_GetNativeWindow();
+	/* Acquire the native window with the surface lifecycle lock HELD for the
+	 * whole frame. OnSurfaceDestroyed (UI thread) blocks until this frame's
+	 * write completes, so the render thread can never write into a surface
+	 * that is being torn down. The old flow (GetNativeWindow -> release lock
+	 * -> render) left a use-after-free window on every surface rebuild:
+	 * window resizes on real hardware crashed in EVERY drag direction
+	 * (heap corruption visible as a wild pc inside libace_compatible, and
+	 * pc=0 through a cleared callback on phones). SDL_OHOS_ReleaseNativeWindow()
+	 * must be called on EVERY exit path below. */
+	native_window = (OHNativeWindow *)SDL_OHOS_AcquireNativeWindow();
 	if (native_window == NULL)
 	{
 		return SDL_SetError("No native window");
@@ -140,11 +149,32 @@ static int OHOS_UpdateWindowFramebuffer(_THIS, SDL_Window *window,
 	}
 	if (bw <= 0 || bh <= 0)
 	{
+		SDL_OHOS_ReleaseNativeWindow();
 		return SDL_SetError("OHOS: invalid buffer size");
 	}
-	if (OH_NativeWindow_NativeWindowHandleOpt(native_window, SET_BUFFER_GEOMETRY, bw, bh) != 0)
+	/* Window resize race mitigation: during maximize/restore transitions the
+	 * consumer can hand out buffers smaller than the geometry we set a moment
+	 * ago. Re-asserting SET_BUFFER_GEOMETRY EVERY frame widens that race
+	 * window (each call re-negotiates with the compositor mid-transition);
+	 * set it only when the requested size actually changes. */
 	{
-		return SDL_SetError("OHOS: SET_BUFFER_GEOMETRY failed");
+		static int32_t last_bw = -1, last_bh = -1;
+		if (bw != last_bw || bh != last_bh)
+		{
+			if (OH_NativeWindow_NativeWindowHandleOpt(native_window, SET_BUFFER_GEOMETRY, bw, bh) != 0)
+			{
+				SDL_OHOS_ReleaseNativeWindow();
+				return SDL_SetError("OHOS: SET_BUFFER_GEOMETRY failed");
+			}
+			last_bw = bw;
+			last_bh = bh;
+			if (SDL_OHOS_DiagLog)
+			{
+				char diag[96];
+				snprintf(diag, sizeof(diag), "upd: geometry set %dx%d", bw, bh);
+				SDL_OHOS_DiagLog(diag);
+			}
+		}
 	}
 
 	/* LockBuffer is the only path whose buffers actually present on this
@@ -166,6 +196,7 @@ static int OHOS_UpdateWindowFramebuffer(_THIS, SDL_Window *window,
 	}
 	else
 	{
+		SDL_OHOS_ReleaseNativeWindow();
 		return SDL_SetError("OHOS: NativeWindowRequestBuffer failed");
 	}
 
@@ -190,7 +221,56 @@ static int OHOS_UpdateWindowFramebuffer(_THIS, SDL_Window *window,
 			OHOS_NW_UnlockAndFlushBuffer(native_window);
 		else
 			OH_NativeWindow_NativeWindowAbortBuffer(native_window, buffer);
+		SDL_OHOS_ReleaseNativeWindow();
 		return SDL_SetError("OHOS: buffer has no writable address");
+	}
+
+	/* Window resize race: the consumer may hand us a buffer SMALLER than the
+	 * geometry we just requested (the ArkTS side updates the physical size
+	 * one frame later, and the compositor switches the window size
+	 * asynchronously on maximize/restore). Writing the requested (stale,
+	 * larger) geometry into the actual (smaller) buffer overflows it and
+	 * segfaults - the "press the system restore button and the game dies"
+	 * crash. Always trust the buffer's own geometry for the write loop.
+	 * NOTE: GET_BUFFER_GEOMETRY takes height FIRST, then width. */
+	{
+		static int32_t last_w = -1, last_h = -1;
+		int32_t gw = 0, gh = 0;
+		if (OH_NativeWindow_NativeWindowHandleOpt(native_window, GET_BUFFER_GEOMETRY, &gh, &gw) == 0 &&
+			gw > 0 && gh > 0 && (gw < bw || gh < bh))
+		{
+			bw = (gw < bw) ? gw : bw;
+			bh = (gh < bh) ? gh : bh;
+			if (SDL_OHOS_DiagLog && (bw != last_w || bh != last_h))
+			{
+				char diag[96];
+				snprintf(diag, sizeof(diag), "upd: clamped write to %dx%d", bw, bh);
+				SDL_OHOS_DiagLog(diag);
+			}
+		}
+		last_w = bw;
+		last_h = bh;
+	}
+
+	/* Capacity clamp from the buffer handle itself. GET_BUFFER_GEOMETRY
+	 * reports the REQUESTED geometry - right after our own SET it echoes
+	 * that request back, so it can never catch the compositor handing out a
+	 * smaller buffer mid-resize. Real hardware (HarmonyOS PC) resizes hit
+	 * exactly that window and crashed in EVERY drag direction once the
+	 * per-frame SET was throttled (krkr_fault.txt: pc jumped to a wild
+	 * address inside libace_compatible - heap corruption from the overflow).
+	 * The handle's stride (row bytes) and total size give the true writable
+	 * area regardless of any request timing. RGBA_8888:
+	 * capacity_rows = size / stride, max_columns = stride / 4. */
+	{
+		int32_t stride_px = (handle->stride > 0) ? handle->stride / 4 : 0;
+		int32_t cap_rows = (handle->stride > 0)
+			? (int32_t)((uint64_t)handle->size / (uint64_t)handle->stride)
+			: 0;
+		if (stride_px > 0 && bw > stride_px)
+			bw = stride_px;
+		if (cap_rows > 0 && bh > cap_rows)
+			bh = cap_rows;
 	}
 
 	/* Copy the SDL surface (ARGB8888) into the native buffer, scaling from
@@ -249,6 +329,7 @@ static int OHOS_UpdateWindowFramebuffer(_THIS, SDL_Window *window,
 	{
 		if (OHOS_NW_UnlockAndFlushBuffer(native_window) != 0)
 		{
+			SDL_OHOS_ReleaseNativeWindow();
 			return SDL_SetError("OHOS: UnlockAndFlushBuffer failed");
 		}
 	}
@@ -259,12 +340,14 @@ static int OHOS_UpdateWindowFramebuffer(_THIS, SDL_Window *window,
 		region.rectNumber = 0;
 		if (OH_NativeWindow_NativeWindowFlushBuffer(native_window, buffer, fence_fd, region) != 0)
 		{
+			SDL_OHOS_ReleaseNativeWindow();
 			return SDL_SetError("OHOS: FlushBuffer failed");
 		}
 	}
 	(void)rects;
 	(void)numrects;
 	(void)dummy;
+	SDL_OHOS_ReleaseNativeWindow();
 	return 0;
 }
 
@@ -531,7 +614,18 @@ static void OHOS_SetWindowPosition(_THIS, SDL_Window *window)
 static void OHOS_SetWindowSize(_THIS, SDL_Window *window)
 {
 	(void)_this;
-	(void)window;
+	/* krkr2 settings-menu "resolution" switches funnel into
+	 * SDL_SetWindowSize. The old stub made the control a silent no-op.
+	 * Log the request so a dead control (script disables it before ever
+	 * calling here) is distinguishable from a swallowed request. The
+	 * compositor keeps presenting the fixed 1920x1080 surface. */
+	if (SDL_OHOS_DiagLog)
+	{
+		char diagbuf[96];
+		snprintf(diagbuf, sizeof(diagbuf),
+			"driver: OHOS_SetWindowSize %dx%d", window->w, window->h);
+		SDL_OHOS_DiagLog(diagbuf);
+	}
 }
 
 static void OHOS_ShowWindow(_THIS, SDL_Window *window)
@@ -551,5 +645,153 @@ static void OHOS_SetWindowFullscreen(_THIS, SDL_Window *window, SDL_VideoDisplay
 	(void)_this;
 	(void)window;
 	(void)display;
-	(void)fullscreen;
+	/* The XComponent surface is managed by the ArkTS shell: forward the
+	 * switch to it (the 100 ms poll applies window.setFullScreen, which
+	 * toggles the OS fullscreen state on HarmonyOS PC / 2-in-1 tablets).
+	 * The SDL window keeps its logical size either way - the compositor
+	 * stretches the buffer into the 16:9 surface. */
+	if (SDL_OHOS_DiagLog)
+	{
+		SDL_OHOS_DiagLog("driver: OHOS_SetWindowFullscreen reached");
+	}
+	if (SDL_OHOS_SetAppFullscreen)
+	{
+		SDL_OHOS_SetAppFullscreen(fullscreen ? 1 : 0);
+	}
+}
+
+/* --- Fullscreen/windowed request state ----------------------------------- */
+/* Lives in this file (libkrkrsdl2.so) so the engine's SDLApplication.cpp and
+ * this video driver resolve the bridge within their own .so at LINK time -
+ * the previous placement in libentry.so relied on a run-time weak binding
+ * across two .so files, which made the game-menu fullscreen switch a no-op
+ * on some devices. libentry.so reaches these through the exported dynamic
+ * symbols (napi pollFullscreen/ackFullscreen). */
+#include <stdatomic.h>
+#include <stdio.h>
+#include <time.h>
+#include <unistd.h>
+
+static atomic_int g_ohos_fullscreen_request = -1; /* -1 none / 0 windowed / 1 fullscreen */
+static atomic_int g_ohos_fullscreen_state = -1;   /* -1 unknown / 0 windowed / 1 fullscreen */
+static atomic_int g_ohos_winsize_req_w = -1;      /* pending window-size request, -1 = none */
+static atomic_int g_ohos_winsize_req_h = -1;      /* pending window-size request, -1 = none */
+
+/* Diagnostic sink shared by engine, driver and shell (napi diagLog).
+ * Appends one line to <data dir>/diag_fullscreen.log, falling back to the
+ * app files dir. Callers throttle repeated values themselves. */
+void SDL_OHOS_DiagLog(const char *line)
+{
+	/* Diagnostics disabled (shipping build): the fullscreen/window-size
+	 * forensics are done, so the log file is no longer written. The symbol
+	 * and all call sites are kept so the traces can be re-enabled by
+	 * restoring this body. */
+	(void)line;
+}
+
+
+void SDL_OHOS_SetAppFullscreen(int fullscreen)
+{
+	int v = fullscreen ? 1 : 0;
+	atomic_store_explicit(&g_ohos_fullscreen_request, v,
+		memory_order_release);
+	if (SDL_OHOS_DiagLog)
+	{
+		char diagbuf[64];
+		snprintf(diagbuf, sizeof(diagbuf), "state: request=%d", v);
+		SDL_OHOS_DiagLog(diagbuf);
+	}
+}
+
+int SDL_OHOS_GetAppFullscreenState(void)
+{
+	/* Prefer a PENDING request over the last applied state: the settings
+	 * menu draws its toggle from this value, and returning the applied
+	 * state makes the control lag one interaction behind - the request
+	 * needs an ArkUI round trip (setFullScreen + recover + resize) before
+	 * the ack lands, while the menu repaints immediately after the click.
+	 * The ack clears the request to -1, so the real applied state wins
+	 * again once the shell has caught up. */
+	int r = atomic_load_explicit(&g_ohos_fullscreen_request, memory_order_acquire);
+	if (r == 0 || r == 1)
+	{
+		return r;
+	}
+	int s = atomic_load_explicit(&g_ohos_fullscreen_state, memory_order_acquire);
+	/* Throttled: the settings menu polls this constantly (FullScreenGuard);
+	 * only log when the applied state actually changes. */
+	static atomic_int logged = -999;
+	int prev = atomic_exchange_explicit(&logged, s, memory_order_relaxed);
+	if (prev != s && SDL_OHOS_DiagLog)
+	{
+		char diagbuf[64];
+		snprintf(diagbuf, sizeof(diagbuf), "state: read=%d", s);
+		SDL_OHOS_DiagLog(diagbuf);
+	}
+	return s;
+}
+
+int SDL_OHOS_PollFullscreenRequest(void)
+{
+	return atomic_load_explicit(&g_ohos_fullscreen_request, memory_order_acquire);
+}
+
+void SDL_OHOS_AckFullscreen(int applied)
+{
+	atomic_store_explicit(&g_ohos_fullscreen_state, applied, memory_order_release);
+	/* Clear the pending request only when it still matches what the shell
+	 * applied, so a newer request written in between (the user flipped the
+	 * switch again) is not lost. */
+	int expected = applied;
+	atomic_compare_exchange_strong_explicit(&g_ohos_fullscreen_request,
+		&expected, -1, memory_order_release, memory_order_acquire);
+	if (SDL_OHOS_DiagLog)
+	{
+		char diagbuf[96];
+		snprintf(diagbuf, sizeof(diagbuf), "state: ack=%d cleared=%d req_now=%d",
+			applied, expected == applied ? 1 : 0,
+			atomic_load_explicit(&g_ohos_fullscreen_request, memory_order_acquire));
+		SDL_OHOS_DiagLog(diagbuf);
+	}
+}
+
+/* --- Window-size request state (OHOS desktop "resolution" switch) --------- */
+/* The engine's SetZoom forwards the requested logical size here (windowed
+ * mode only); the shell's poll picks it up and resizes the OS window. One
+ * atomic exchange consumes the pair, so a request is applied exactly once. */
+void SDL_OHOS_SetAppWindowSize(int w, int h)
+{
+	if (w <= 0 || h <= 0)
+	{
+		return;
+	}
+	atomic_store_explicit(&g_ohos_winsize_req_w, w, memory_order_release);
+	atomic_store_explicit(&g_ohos_winsize_req_h, h, memory_order_release);
+	if (SDL_OHOS_DiagLog)
+	{
+		char diagbuf[96];
+		snprintf(diagbuf, sizeof(diagbuf), "state: winsize request=%dx%d", w, h);
+		SDL_OHOS_DiagLog(diagbuf);
+	}
+}
+
+int SDL_OHOS_PollWindowSizeRequest(int *w, int *h)
+{
+	int rw = atomic_exchange_explicit(&g_ohos_winsize_req_w, -1,
+		memory_order_acq_rel);
+	int rh = atomic_exchange_explicit(&g_ohos_winsize_req_h, -1,
+		memory_order_acq_rel);
+	if (rw <= 0 || rh <= 0)
+	{
+		return 0;
+	}
+	if (w)
+	{
+		*w = rw;
+	}
+	if (h)
+	{
+		*h = rh;
+	}
+	return 1;
 }

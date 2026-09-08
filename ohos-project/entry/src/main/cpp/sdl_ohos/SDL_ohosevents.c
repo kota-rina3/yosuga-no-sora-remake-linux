@@ -276,7 +276,18 @@ void SDL_OHOS_OnFingerEvent(int finger_id, int touch_type, float x, float y)
 
 void SDL_OHOS_OnSurfaceChanged(int width, int height)
 {
-	/* diagnostic: prove this UI-thread callback does not stall */
+	/* Diagnostic log only - deliberately NO window resize. The native
+	 * OnSurfaceChanged callback does not fire on current HarmonyOS systems
+	 * (the ArkTS onAreaChange -> setSurfaceSize path reports the physical
+	 * size for touch scaling instead), but if it ever fires (newer PC
+	 * builds), resizing the SDL window away from the game's logical
+	 * 1920x1080 layer size would break the engine's coordinate system
+	 * ("Scan line 0 is range over"). Render-time adaptation to a resized
+	 * surface is handled by re-pinning the buffer geometry in
+	 * OHOS_GL_SwapWindow (GL) / OHOS_UpdateWindowFramebuffer (software);
+	 * the compositor stretches the logical buffer into the 16:9 surface. */
+	(void)width;
+	(void)height;
 	{
 		const char *dd = SDL_OHOS_GetFilesDir();
 		if (dd && dd[0])
@@ -284,30 +295,8 @@ void SDL_OHOS_OnSurfaceChanged(int width, int height)
 			char lpath[512];
 			snprintf(lpath, sizeof(lpath), "%s/diag.txt", dd);
 			FILE *lf = fopen(lpath, "a");
-			if (lf) { fprintf(lf, "ev: OnSurfaceChanged enter %dx%d\n", width, height); fclose(lf); }
+			if (lf) { fprintf(lf, "ev: OnSurfaceChanged ignored %dx%d\n", width, height); fclose(lf); }
 		}
-	}
-	SDL_VideoDevice *device = SDL_GetVideoDevice();
-	OHOS_VideoData *videodata;
-	SDL_Window *window;
-
-	if (device == NULL || device->driverdata == NULL)
-	{
-		return;
-	}
-	videodata = (OHOS_VideoData *)device->driverdata;
-	window = videodata->window;
-	if (window == NULL || width <= 0 || height <= 0)
-	{
-		return;
-	}
-
-	if (window->w != width || window->h != height)
-	{
-		/* Update the window fields before pushing the resize event. */
-		window->w = width;
-		window->h = height;
-		SDL_SendWindowEvent(window, SDL_WINDOWEVENT_RESIZED, width, height);
 	}
 }
 

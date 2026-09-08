@@ -77,6 +77,9 @@ struct SDL_PrivateAudioData
     SDL_mutex *lock;
     SDL_cond *cond;
     int shutdown;
+    /* Set while an audio-interruption (alarm, call, ...) has taken the
+     * focus away from the renderer; cleared when playback is resumed. */
+    int interrupted;
 };
 
 
@@ -154,8 +157,48 @@ static int32_t OHOSAUDIO_StreamEventCallback(OH_AudioRenderer *renderer, void *u
 static int32_t OHOSAUDIO_InterruptCallback(OH_AudioRenderer *renderer, void *userData,
     OH_AudioInterrupt_ForceType type, OH_AudioInterrupt_Hint hint)
 {
+    struct SDL_PrivateAudioData *hidden = (struct SDL_PrivateAudioData *)userData;
     (void)renderer;
-    (void)userData;
+    (void)type;
+    if (hidden == NULL)
+    {
+        return AUDIOSTREAM_SUCCESS;
+    }
+    /* An alarm / call / ringtone takes the audio focus away mid-game.
+     * With the default (shared) interrupt mode the service PAUSES the
+     * renderer for us on INTERRUPT_BEGIN (hint PAUSE/STOP) and expects the
+     * application to restart it when the interruption ends - without
+     * handling the END event here the game stays silent forever after the
+     * alarm goes off. Resume the stream and drop the audio that piled up
+     * in the ring while the game was muted, so playback continues from the
+     * current mixer output instead of a burst of stale sound. */
+    switch (hint)
+    {
+        /* API 12 NDK names (native_audiostream_base.h); the system-internal
+         * AUDIOINTERRUPT_HINT_* aliases do not exist in the app SDK. */
+        case AUDIOSTREAM_INTERRUPT_HINT_PAUSE:
+        case AUDIOSTREAM_INTERRUPT_HINT_STOP:
+            hidden->interrupted = 1;
+            /* Idempotent: the service usually already paused the stream;
+             * this only matters for implementations that expect the app to
+             * do it. Errors are ignored on purpose. */
+            OH_AudioRenderer_Pause(hidden->renderer);
+            break;
+        case AUDIOSTREAM_INTERRUPT_HINT_RESUME:
+        case AUDIOSTREAM_INTERRUPT_HINT_NONE:
+        default:
+            if (hidden->interrupted)
+            {
+                hidden->interrupted = 0;
+                SDL_LockMutex(hidden->lock);
+                /* Drop stale mixed audio queued before the interruption. */
+                hidden->ring_read = hidden->ring_write;
+                SDL_CondSignal(hidden->cond);
+                SDL_UnlockMutex(hidden->lock);
+                OH_AudioRenderer_Start(hidden->renderer);
+            }
+            break;
+    }
     return AUDIOSTREAM_SUCCESS;
 }
 

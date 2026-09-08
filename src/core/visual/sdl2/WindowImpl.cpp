@@ -1171,10 +1171,23 @@ void tTJSNI_Window::ResetDrawDevice()
 }
 //---------------------------------------------------------------------------
 void tTJSNI_Window::FullScreenGuard() const {
+#ifdef __OHOS__
+	/* On HarmonyOS the OS-level fullscreen (window.setFullScreen driven
+	 * through the SDL OHOS bridge) lives entirely outside the engine window
+	 * concept - the game canvas stays a 16:9 letterbox layer either way.
+	 * The legacy guard rejects window property changes while an exclusive
+	 * fullscreen mode is active, which is not applicable here: the game
+	 * scripts legitimately restore the saved fullscreen state during
+	 * startup and then touch window properties ('visible = true' in
+	 * Window.tjs), which the guard answered with "Invalid property in
+	 * fullscreen" and killed the engine right at startup. */
+	return;
+#else
 	if( Form ) {
 		if(Form->GetFullScreenMode())
 			TVPThrowExceptionMessage(TVPInvalidPropertyInFullScreen);
 	}
+#endif
 }
 //---------------------------------------------------------------------------
 void tTJSNI_Window::PostInputEvent(const ttstr &name, iTJSDispatch2 * params)
@@ -1777,8 +1790,28 @@ bool tTJSNI_Window::GetShowScrollBars() const
 }
 #endif
 //---------------------------------------------------------------------------
+#ifdef __OHOS__
+/* Weak bridge into libkrkrsdl2.so (SDL_ohosvideo.c): diagnostic sink shared
+ * by the whole fullscreen chain. Declared at file scope - a linkage
+ * specification block inside a function body does not compile on the OHOS
+ * clang. Weak + runtime-checked, and only declared on OHOS (__attribute__
+ * is a GNU extension MSVC does not take). */
+extern "C" void SDL_OHOS_DiagLog(const char *line) __attribute__((weak));
+#endif
+//---------------------------------------------------------------------------
 void tTJSNI_Window::SetFullScreen(bool b)
 {
+	/* Diagnostic: confirm the TJS settings menu actually reaches this
+	 * property (it was not registered on the Window class at all before,
+	 * which silently swallowed the game-menu fullscreen switch). */
+#ifdef __OHOS__
+	if (SDL_OHOS_DiagLog)
+	{
+		char diagbuf[96];
+		snprintf(diagbuf, sizeof(diagbuf), "tjs: Window.fullScreen = %d", b ? 1 : 0);
+		SDL_OHOS_DiagLog(diagbuf);
+	}
+#endif
 	if(!Form) return;
 	Form->SetFullScreenMode(b);
 }
@@ -2304,6 +2337,26 @@ TJS_BEGIN_NATIVE_PROP_DECL(drawDevice)
 	TJS_END_NATIVE_PROP_SETTER
 }
 TJS_END_NATIVE_PROP_DECL_OUTER(cls, drawDevice)
+//---------------------------------------------------------------------------
+TJS_BEGIN_NATIVE_PROP_DECL(fullScreen)
+{
+	TJS_BEGIN_NATIVE_PROP_GETTER
+	{
+		TJS_GET_NATIVE_INSTANCE(/*var. name*/_this, /*var. type*/tTJSNI_Window);
+		*result = _this->GetFullScreen();
+		return TJS_S_OK;
+	}
+	TJS_END_NATIVE_PROP_GETTER
+
+	TJS_BEGIN_NATIVE_PROP_SETTER
+	{
+		TJS_GET_NATIVE_INSTANCE(/*var. name*/_this, /*var. type*/tTJSNI_Window);
+		_this->SetFullScreen(((tjs_int)*param) ? true : false);
+		return TJS_S_OK;
+	}
+	TJS_END_NATIVE_PROP_SETTER
+}
+TJS_END_NATIVE_PROP_DECL_OUTER(cls, fullScreen)
 //---------------------------------------------------------------------------
 TJS_BEGIN_NATIVE_PROP_DECL(touchScaleThreshold)
 {

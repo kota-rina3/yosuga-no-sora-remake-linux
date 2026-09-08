@@ -4,9 +4,13 @@
  * vendored SDL2 OpenHarmony backend.
  *
  * The declarations in this header are implemented in two places:
+ *   - SDL_ohosvideo.c         (libkrkrsdl2.so): touch event delivery AND the
+ *     fullscreen/windowed request state (the engine's SDLApplication.cpp and
+ *     its SDL video driver resolve those within their own .so at link time;
+ *     libentry.so reaches them through the exported dynamic symbols).
  *   - krkrsdl2_ohos_entry.cpp  (libentry.so): files directory, XComponent
  *     surface state and the native window wait/query helpers.
- *   - SDL_ohosevents.c         (libSDL2): touch event delivery.
+ *   - SDL_ohosevents.c         (libSDL2 and libentry): touch event plumbing.
  *
  * tools/setup_ohos_project.py copies this header into the vendored SDL tree
  * so both sides compile against identical declarations.
@@ -63,6 +67,15 @@ OHOS_EXPORT int SDL_OHOS_WaitForNativeWindow(int timeout_ms) __attribute__((weak
 /* Return the OHNativeWindow, or NULL when the surface is not ready. */
 OHOS_EXPORT void *SDL_OHOS_GetNativeWindow(void) __attribute__((weak));
 
+/* Frame-scoped surface acquisition: returns the OHNativeWindow with the
+ * surface lifecycle lock HELD so OnSurfaceDestroyed/OnSurfaceChanged cannot
+ * run mid-frame. MUST be paired with SDL_OHOS_ReleaseNativeWindow() on every
+ * exit path. Returns NULL when the surface is not ready (no lock held). */
+OHOS_EXPORT void *SDL_OHOS_AcquireNativeWindow(void) __attribute__((weak));
+
+/* Release the lifecycle lock taken by SDL_OHOS_AcquireNativeWindow. */
+OHOS_EXPORT void SDL_OHOS_ReleaseNativeWindow(void) __attribute__((weak));
+
 /* Return the current surface size in pixels. Returns 1 when valid. */
 OHOS_EXPORT int SDL_OHOS_GetSurfaceSize(int *width, int *height) __attribute__((weak));
 
@@ -98,6 +111,46 @@ OHOS_EXPORT void SDL_OHOS_OnMouseEvent(int action, int button, int x, int y) __a
  * OHOS KeyCode (ohos.multimodalInput.keyCode); the SDL backend maps it to
  * a scancode for the keys the game uses. */
 OHOS_EXPORT void SDL_OHOS_OnKeyEvent(int down, int keycode) __attribute__((weak));
+
+/* Request the ArkTS shell to switch the OS window between fullscreen and
+ * windowed mode (HarmonyOS PC / 2-in-1 tablets - the game settings menu
+ * maps its fullscreen/windowed buttons onto this). The request is stored
+ * here and picked up by the shell's 100 ms poll (pollFullscreen /
+ * ackFullscreen NAPI functions); fullscreen ? 1 : 0.
+ * Implemented in SDL_ohosvideo.c (libkrkrsdl2.so) so the engine and its
+ * SDL video driver resolve it within their own .so at link time. */
+OHOS_EXPORT void SDL_OHOS_SetAppFullscreen(int fullscreen) __attribute__((weak));
+
+/* Current applied fullscreen state: -1 = unknown (never switched yet),
+ * 0 = windowed, 1 = fullscreen. Backs the engine's GetFullScreenMode. */
+OHOS_EXPORT int SDL_OHOS_GetAppFullscreenState(void) __attribute__((weak));
+
+/* Polled by the ArkTS shell (libentry.so): the pending fullscreen request,
+ * or -1 when there is none. Implemented in SDL_ohosvideo.c. */
+OHOS_EXPORT int SDL_OHOS_PollFullscreenRequest(void) __attribute__((weak));
+
+/* Acknowledge the shell applied the requested fullscreen state (0 windowed /
+ * 1 fullscreen): records the applied state and clears the pending request
+ * with a CAS so a newer request written in between is not lost. */
+OHOS_EXPORT void SDL_OHOS_AckFullscreen(int applied) __attribute__((weak));
+
+/* OHOS desktop "resolution" switch: the engine's SetZoom forwards the
+ * requested logical window size here (windowed mode only); the shell's
+ * poll reads it with SDL_OHOS_PollWindowSizeRequest and resizes the OS
+ * window. Implemented in SDL_ohosvideo.c (libkrkrsdl2.so). */
+OHOS_EXPORT void SDL_OHOS_SetAppWindowSize(int w, int h) __attribute__((weak));
+
+/* Polled by the ArkTS shell (libentry.so): consumes a pending window-size
+ * request (one-shot exchange). Returns 1 and fills w/h when a request was
+ * pending, 0 otherwise. */
+OHOS_EXPORT int SDL_OHOS_PollWindowSizeRequest(int *w, int *h) __attribute__((weak));
+
+/* Append one diagnostic line to <data dir>/diag_fullscreen.log (falls back
+ * to the files dir). Used to trace the fullscreen switch chain (TJS ->
+ * engine -> driver -> state atom -> napi -> ArkTS) and the actual
+ * XComponent canvas size on HarmonyOS PC / tablets. One fopen/append/fclose
+ * per line; callers throttle repeated values. */
+OHOS_EXPORT void SDL_OHOS_DiagLog(const char *line) __attribute__((weak));
 
 #ifdef __cplusplus
 }

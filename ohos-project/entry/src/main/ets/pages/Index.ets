@@ -9,7 +9,19 @@ import { preferences } from '@kit.ArkData';
 import { cryptoFramework } from '@kit.CryptoArchitectureKit';
 import { promptAction, window } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { unzipTask, copyFileTask, sha256Task, copyUriTask, moveTreeTask, removeTreeTask } from '../workers/DataWorkers';
+import deviceInfo from '@ohos.deviceInfo';
+import display from '@ohos.display';
+import { unzipTask, copyFileTask, sha256Task, copyUriTask, moveTreeTask, mergeTreeTask, removeTreeTask } from '../workers/DataWorkers';
+
+/* PC/tablet game surface: FIXED virtual resolution in physical pixels.
+ * Real-device forensics (v1.0.8) proved the HarmonyOS PC ArkUI framework
+ * crashes inside its XComponent surface-resize path with an identical
+ * wild-pc stack regardless of what the render thread does, so the surface
+ * must never change size on window resizes. The game surface stays at this
+ * fixed size and is fitted into the window with a GPU transform (.scale);
+ * window resizes only change the transform. */
+const GAME_VIRTUAL_W_PX = 1920;
+const GAME_VIRTUAL_H_PX = 1080;
 
 
 /** data-assets.json entry. */
@@ -55,6 +67,21 @@ interface DataManifest {
   releaseTag: string;
   baseUrl: string;
   assets: DataAsset[];
+  /** Total file count of a COMPLETE dataset (all archives combined);
+   *  older releases omit it - the summed per-asset fileCount is used. */
+  fileTotal?: number;
+}
+
+/** In-pack manifest (data-assets.json at the zip ROOT, written by
+ *  package_data_release.py next to the data/ folder). The importer reads
+ *  it after extracting an archive to know WHICH archive it just installed
+ *  and how many more the release contains. */
+interface PackManifest {
+  kind?: string;
+  packIndex: number;
+  packCount: number;
+  fileCount?: number;
+  fileTotal?: number;
 }
 
 
@@ -81,6 +108,24 @@ struct Index {
   @State bootState: number = 0;
   @State progressText: string = '';
   @State progressValue: number = 0;
+  /* Fitted 16:9 canvas size in vp (HarmonyOS PC screens are mostly 3:2).
+   * Recomputed from the ROOT stack size (always 100% x 100% of the window)
+   * in its onAreaChange - one single driver for every page. Earlier
+   * attempts failed: a self-referencing onAreaChange on the fitted canvas
+   * locked the size at its initial value, and a sizeless component with
+   * only aspectRatio + constraintSize collapsed (its absolutely positioned
+   * percentage children provide no measurement basis), which misplaced all
+   * bootstrap buttons. */
+  @State gameW: number = 1280;
+  @State gameH: number = 720;
+  /* Last value of pollFullscreen written to the diag log, so the 10 Hz poll
+   * only logs when the request actually changes. */
+  private lastFsLog: number = -99;
+  // Second (extract) progress bar: visible while an archive decompression
+  // runs (download pipeline / xp3 unpack), hidden again once it finishes.
+  @State extractText: string = '';
+  @State extractValue: number = 0;
+  @State extractVisible: boolean = false;
   @State baseUrl: string = '';
   @State proxyUrl: string = '';
   @State selectedProxy: number = 1;
@@ -111,6 +156,9 @@ struct Index {
   private confirming: boolean = false;
   private extractTaskStarted: boolean = false;
   private bgTaskCount: number = 0;
+  // Highest packCount seen in any in-pack manifest of the CURRENT import
+  // round: the completeness gate needs it to name the missing archives.
+  private importPackCount: number = 0;
   @State readyForGame: boolean = false;
   private sandboxFiles: string = '';
   private baseDir: string = '';
@@ -120,6 +168,9 @@ struct Index {
   private assets: DataAsset[] = [];
   private manifest: DataManifest | null = null;
   private xcController: XComponentController = new XComponentController();
+  // Surface id currently attached to the engine (re-attached by onAreaChange
+  // whenever a window-mode change rebuilds the surface behind our back).
+  private xcSurfaceId: string = '';
   private xcVideoController: XComponentController = new XComponentController();
   // True while the AVPlayer renders video: the video XComponent is raised
   // above the game XComponent (polled from native, no NAPI callback needed).
@@ -133,10 +184,34 @@ struct Index {
   private hbTick: number = 0;
   private hbStart: number = 0;
 
+  // Game surface layout policy. PC/tablet form factors use a FIXED virtual
+  // resolution (GAME_VIRTUAL_W_PX x GAME_VIRTUAL_H_PX physical px) fitted
+  // into the window with a .scale transform: the XComponent surface itself
+  // never resizes, which sidesteps the ArkUI surface-resize crash proven on
+  // real HarmonyOS PC hardware (identical wild-pc stacks across all resize
+  // directions, before AND after the render-thread fixes that cured the
+  // phone). PHONES keep the original v1.0.4 fitted 16:9 canvas (black bars
+  // left/right) - that variant is stable on phones (confirmed working).
+  @State gameFillsWindow: boolean = true;
+  // PC/tablet transform: gameScale = min(win_px / VIRTUAL_W, win_px / VIRTUAL_H);
+  // gameOffsetX/Y are the centred game-surface origin in window px.
+  @State gameScale: number = 1;
+  @State rootWpx: number = 0;
+  @State rootHpx: number = 0;
+  // Last reported game-surface px size (dedup for the onAreaChange storm;
+  // plain fields on purpose - updating them must NOT re-run build).
+  private lastXcPxW: number = -1;
+  private lastXcPxH: number = -1;
+
   aboutToAppear(): void {
     this.hbStart = Date.now();
     this.sandboxFiles = (getContext(this) as common.UIAbilityContext).filesDir;
     this.buildFlavor = this.readBuildFlavor();
+    try {
+      this.gameFillsWindow = deviceInfo.deviceType !== 'phone';
+    } catch (eDt) {
+      // keep the fill layout when the device type is unavailable
+    }
     this.log('appear t=0 flavor=' + this.buildFlavor);
     if (transferActive) {
       // A transfer thread survived this ability recreation: re-show the
@@ -165,6 +240,175 @@ struct Index {
         this.videoOnTop = entryNapi.isVideoPlaying();
         if (wasVideo !== this.videoOnTop) {
           this.log('videoOnTop -> ' + this.videoOnTop + ' t=' + (Date.now() - this.hbStart));
+        }
+        // Fullscreen/windowed switch requested by the game settings menu
+        // (TJS Window.fullScreen -> native bridge). Only meaningful on
+        // HarmonyOS PC / 2-in-1 / tablet forms with window management: on
+        // phones the window is always fullscreen and the immersive layout
+        // is already applied, so the request is acknowledged without
+        // touching the window (setFullScreen(false) would bring the
+        // status bar back over the game).
+        try {
+          const fsReq: number = entryNapi.pollFullscreen() as number;
+          // Trace the poll itself, but only when the request value changes
+          // (10 Hz otherwise, which would flood the diag file).
+          if (fsReq !== this.lastFsLog) {
+            this.lastFsLog = fsReq;
+            try {
+              entryNapi.diagLog('shell: poll=' + fsReq + ' device=' +
+                deviceInfo.deviceType + ' boot=' + this.bootState);
+            } catch (eDg) {
+              // diag channel not ready
+            }
+          }
+          if (fsReq === 0 || fsReq === 1) {
+            const deviceType: string = deviceInfo.deviceType;
+            if (deviceType === 'phone') {
+              entryNapi.ackFullscreen(fsReq);
+            } else {
+              const ctxFs = getContext(this) as common.UIAbilityContext;
+              window.getLastWindow(ctxFs).then((mainWindow: window.Window): Promise<void> => {
+                try {
+                  entryNapi.diagLog('shell: setFullScreen(' + fsReq + ') calling');
+                } catch (eDg2) {
+                  // ignore
+                }
+                return mainWindow.setFullScreen(fsReq === 1).then((): Promise<void> => {
+                  if (fsReq === 1) {
+                    // Entering fullscreen: stretch the layout into the
+                    // system-bar insets as well. setFullScreen(true) toggles
+                    // the OS fullscreen state, but on 2-in-1 desktops the
+                    // layout may still keep reserved insets - layoutFullScreen
+                    // is the supported stretch (setWindowSystemBarEnable([])
+                    // is a no-op on API 12 2-in-1 devices).
+                    return mainWindow.setWindowLayoutFullScreen(true).then((): Promise<void> => {
+                      try {
+                        entryNapi.diagLog('shell: layoutFullScreen(1) ok');
+                      } catch (eDgA) {
+                        // diag channel not ready
+                      }
+                      // The root onAreaChange is unreliable right after a
+                      // programmatic window change: recompute the fitted
+                      // 16:9 bootstrap canvas AND the fixed-surface
+                      // transform explicitly from the physical display
+                      // size, so the download/import controls stay laid
+                      // out and the picture fills the screen.
+                      try {
+                        const dspFs2 = display.getDefaultDisplaySync();
+                        if (dspFs2.width > 0 && dspFs2.height > 0) {
+                          this.fitGameCanvas(px2vp(dspFs2.width),
+                            px2vp(dspFs2.height));
+                          this.rootWpx = dspFs2.width;
+                          this.rootHpx = dspFs2.height;
+                          const kFs2 = Math.min(dspFs2.width / GAME_VIRTUAL_W_PX,
+                            dspFs2.height / GAME_VIRTUAL_H_PX);
+                          if (kFs2 > 0 &&
+                            Math.abs(kFs2 - this.gameScale) > 0.0001) {
+                            this.gameScale = kFs2;
+                          }
+                        }
+                      } catch (eFsFit) {
+                        // display API unavailable - onAreaChange fallback
+                      }
+                      return Promise.resolve();
+                    }).catch((eLf: Error): Promise<void> => {
+                      try {
+                        entryNapi.diagLog('shell: layoutFullScreen(1) FAILED: ' + JSON.stringify(eLf));
+                      } catch (eDgB) {
+                        // diag channel not ready
+                      }
+                      return Promise.resolve();
+                    });
+                  }
+                  if (fsReq === 0) {
+                    // Leaving fullscreen: restore normal layout first (the
+                    // fullscreen branch stretched it into the insets), then
+                    // setFullScreen(false) only drops the fullscreen flag -
+                    // fullscreen flag - the window stays MAXIMIZED, so the
+                    // user sees no visual change (v1.0.10 emulator forensics:
+                    // poll=0 -> applied, acked yet "windowed" looked dead; the
+                    // resize() call was silently ignored while maximized).
+                    // API 12 REMOVED setWindowMode/WindowMode entirely - the
+                    // supported way out of a maximized window is Window#
+                    // recover(), which restores the pre-maximized size and
+                    // (now floating) unlocks resize. Enforce a 16:9
+                    // game-friendly 1280x720 px floating window after it.
+                    return mainWindow.setWindowLayoutFullScreen(false).catch((): void => {
+                      // layout restore is best-effort
+                    }).then((): Promise<void> => {
+                      return mainWindow.recover().then((): Promise<void> => {
+                      try {
+                        entryNapi.diagLog('shell: recover() ok');
+                      } catch (eDg6) {
+                        // diag channel not ready
+                      }
+                      return mainWindow.resize(px2vp(1920), px2vp(1080)).then((): void => {
+                        try {
+                          entryNapi.diagLog('shell: windowed resize 1920x1080px applied');
+                        } catch (eDg5) {
+                          // diag channel not ready
+                        }
+                        // Explicit re-fit after a programmatic resize (the
+                        // root onAreaChange does not fire reliably): keeps
+                        // the bootstrap controls inside the smaller window.
+                        this.fitGameCanvas(px2vp(1920), px2vp(1080));
+                        this.rootWpx = 1920;
+                        this.rootHpx = 1080;
+                        this.gameScale = 1;
+                      }).catch((eRz: Error): void => {
+                        try {
+                          entryNapi.diagLog('shell: resize-after-recover FAILED: ' + JSON.stringify(eRz));
+                        } catch (eDg7) {
+                          // diag channel not ready
+                        }
+                      });
+                    }).catch((eRc: Error): Promise<void> => {
+                      try {
+                        entryNapi.diagLog('shell: recover() FAILED: ' + JSON.stringify(eRc));
+                      } catch (eDg8) {
+                        // diag channel not ready
+                      }
+                      return mainWindow.resize(px2vp(1920), px2vp(1080)).then((): void => {
+                        this.fitGameCanvas(px2vp(1920), px2vp(1080));
+                        this.rootWpx = 1920;
+                        this.rootHpx = 1080;
+                        this.gameScale = 1;
+                      }).catch((eRz2: Error): void => {
+                        try {
+                          entryNapi.diagLog('shell: windowed resize FAILED: ' + JSON.stringify(eRz2));
+                        } catch (eDg9) {
+                          // diag channel not ready
+                        }
+                      });
+                    });
+                     });
+                  }
+                  return Promise.resolve();
+                });
+              }).then((): void => {
+                entryNapi.ackFullscreen(fsReq);
+                this.log('fullscreen request applied: ' + fsReq);
+                try {
+                  entryNapi.diagLog('shell: setFullScreen(' + fsReq + ') applied, acked');
+                } catch (eDg3) {
+                  // ignore
+                }
+              }).catch((eFs: Error): void => {
+                // Ack anyway so the request is not retried in a hot loop; the
+                // settings checkbox keeps the previous (applied) state.
+                entryNapi.ackFullscreen(fsReq);
+                this.log('fullscreen request failed: ' + JSON.stringify(eFs));
+                try {
+                  entryNapi.diagLog('shell: setFullScreen(' + fsReq + ') FAILED: ' +
+                    JSON.stringify(eFs));
+                } catch (eDg4) {
+                  // ignore
+                }
+              });
+            }
+          }
+        } catch (eFs2) {
+          // native not ready yet (engine not started) - retry next tick
         }
         // The in-game exit button finishes the engine thread; the native
         // side reports "running" until the engine has actually started, so
@@ -215,6 +459,9 @@ struct Index {
         this.log('xp3 present without loose tree -> auto-extract');
         this.extractAndFinalize(this.baseDir + '/data.xp3');
       } else {
+        // Pre-existing data (e.g. an app update kept the folder): the data/
+        // and savedata trees may predate the media-exclusion marker.
+        this.writeNomediaTree();
         this.readyForGame = true;
         this.log('ready -> confirm/start');
         this.confirmDataVersion();
@@ -485,6 +732,45 @@ struct Index {
     }
   }
 
+  /** .nomedia for the whole data layout: the public root, the data/ asset
+   *  tree and the savedata folder. Runs after a download/import completes
+   *  AND when an app update boots with pre-existing data (that data may
+   *  predate the marker - the media library would otherwise index the
+   *  game sprites and save thumbnails into the gallery). */
+  private writeNomediaTree(): void {
+    this.writeNomedia(this.baseDir);
+    this.writeNomedia(this.dataDir);
+    this.writeNomedia(this.saveDir);
+    // Verification breadcrumb (sandbox-visible via hdc): which .nomedia
+    // markers exist after the pass. Uses statSync - this device's
+    // accessSync reports nonexistent paths as present.
+    try {
+      const st = (p: string): string => {
+        try {
+          fs.statSync(p);
+          return '1';
+        } catch (e) {
+          return '0';
+        }
+      };
+      const f = fs.openSync(this.sandboxFiles + '/nomedia_check.txt',
+        fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      const imgHpx = Math.min(this.rootWpx, this.rootHpx * 16 / 9);
+      fs.writeSync(f.fd, 'base=' + st(this.baseDir + '/.nomedia') +
+        ' data=' + st(this.dataDir + '/.nomedia') +
+        ' save=' + st(this.saveDir + '/.nomedia') +
+        ' | gameW=' + this.gameW + ' gameH=' + this.gameH +
+        ' rootWpx=' + this.rootWpx + ' rootHpx=' + this.rootHpx +
+        ' vp1px=' + px2vp(1) +
+        ' barVp=' + (this.rootHpx > 0 && this.rootWpx > 0
+          ? px2vp((this.rootHpx - imgHpx) / 2) : -1) +
+        ' fills=' + (this.gameFillsWindow ? 1 : 0));
+      fs.closeSync(f);
+    } catch (e) {
+      // best effort
+    }
+  }
+
   /**
    * Synchronously resolve baseDir/saveDir/dataDir from the app-owned public
    * Download folder (marker-present) or the sandbox, so a data-ready app can
@@ -711,6 +997,7 @@ struct Index {
         // may already exist
       }
       this.writeNomedia(dir);
+      this.writeNomedia(dir + '/savedata');
       this.lastDirectError = '';
       this.log('tryDirectAt: ok ' + dir);
       return true;
@@ -743,6 +1030,7 @@ struct Index {
       // already exists
     }
     this.writeNomedia(this.appDir);
+    this.writeNomedia(this.saveDir);
     this.message = '';
     this.log('data dir: public ' + this.appDir);
   }
@@ -783,6 +1071,7 @@ struct Index {
           // may already exist
         }
         this.writeNomedia(this.appDir);
+        this.writeNomedia(this.appDir + '/savedata');
         try {
           const marker = fs.openSync(this.appDir + '/.granted',
             fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
@@ -974,12 +1263,57 @@ struct Index {
     let doneBytes = 0;
     const totalBytes = this.assets.reduce((sum, asset) => sum + asset.size, 0);
     const startTime = Date.now();
+    // Peak storage = archives + the extracted copy living side by side.
+    // Check BEFORE pulling gigabytes so a small data partition fails fast
+    // with a readable message instead of dying mid-pack (13900025).
+    const spaceErr = await this.checkFreeSpace(this.sandboxFiles,
+      totalBytes * 2 + 512 * 1024 * 1024);
+    if (spaceErr !== '') {
+      this.message = spaceErr;
+      this.bootState = 2;
+      this.uiEpoch++;
+      await this.showNotice('存储空间不足', spaceErr);
+      return;
+    }
     // All downloaded zips extract into ONE sandbox staging dir
     // (decompressFile requires sandbox paths); installUnzipped moves the
     // result to the public data folder afterwards.
     const unzipTmp = this.sandboxFiles + '/unzip.tmp';
     await taskpool.execute(removeTreeTask, unzipTmp);
+    // Extraction pipeline: finished archives are chained onto a serial
+    // Promise chain while the download loop keeps fetching the next one -
+    // decompression no longer stalls the transfer. The chain runs ONE
+    // unzipTo at a time (startExtractTask/stopExtractTask pairs are then
+    // never interleaved) and unzips into the single shared staging dir.
+    const packCount = this.assets.length;
+    let extractDone = 0;
+    let extractFailed = false;
+    let extractChain: Promise<void> = Promise.resolve();
+    const runExtract = (name: string, tmpPath: string): void => {
+      extractChain = extractChain.then(async (): Promise<void> => {
+        this.showExtractBar('正在解压 ' + name +
+          '…（' + (extractDone + 1) + '/' + packCount + '）', 0);
+        await this.unzipTo(tmpPath, unzipTmp);
+        try {
+          fs.unlinkSync(tmpPath);
+        } catch (e) {
+          // ignore
+        }
+        extractDone++;
+        this.showExtractBar('正在解压 ' + name +
+          '…（' + extractDone + '/' + packCount + '）',
+          Math.floor(extractDone * 100 / Math.max(1, packCount)));
+      }).catch((e: Error) => {
+        extractFailed = true;
+        throw e as Error;
+      });
+    };
     for (const asset of this.assets) {
+      // Stop pulling new archives once extraction has failed; the wrap-up
+      // below reports the error.
+      if (extractFailed) {
+        break;
+      }
       const originalUrl = this.baseUrl + asset.name;
       const proxy = this.proxyUrl.trim();
       const url = proxy !== '' ? proxy + originalUrl : originalUrl;
@@ -1028,27 +1362,49 @@ struct Index {
         // stage) - landing there reads as a random black screen. Go back to
         // the setup page instead, where the error text and the proxy
         // buttons are visible for an immediate retry.
+        // A running extraction must finish first: the chained unzipTask
+        // writes into unzip.tmp, and a restart would wipe it mid-write.
+        await extractChain.catch((err: Error) => {
+          return;
+        });
+        this.hideExtractBar();
         await this.setScreenOn(false);
         this.progressValue = 0;
         this.bootState = 2;
         this.uiEpoch++;
-        this.message = '下载失败：' + asset.name + '（' + JSON.stringify(e) + '）\n' +
+        const fsReason = this.describeFsError(e);
+        this.message = '下载失败：' + asset.name + '（' +
+          (fsReason !== '' ? fsReason + ' ' : '') + JSON.stringify(e) + '）\n' +
           '若为网络问题，请返回引导页点击「gh-proxy」或「我的代理」切换加速后再下载';
         return;
       }
-      await this.unzipTo(tmp, unzipTmp);
-      try {
-        fs.unlinkSync(tmp);
-      } catch (e) {
-        // ignore
-      }
+      // Pipeline: queue the extraction and keep downloading the next pack
+      // right away - doneBytes tracks downloaded bytes only.
+      runExtract(asset.name, tmp);
       doneBytes += asset.size;
       this.progressValue = Math.min(99, Math.floor(doneBytes * 100 / Math.max(1, totalBytes)));
-      await this.delay(50);
     }
+    // All archives are downloading/downloaded: wait for the extraction
+    // chain to finish before installing the staged tree.
+    try {
+      await extractChain;
+    } catch (e) {
+      // Extraction failed: land on the setup page with the reason (same
+      // shape as the download-failure landing above).
+      this.hideExtractBar();
+      await this.setScreenOn(false);
+      this.progressValue = 0;
+      this.bootState = 2;
+      this.uiEpoch++;
+      this.message = '解压失败：' + JSON.stringify(e) + '\n请重试下载，或改用本地导入数据包';
+      return;
+    }
+    this.hideExtractBar();
     this.progressText = '正在准备游戏数据…';
     this.uiEpoch++;
-    const ok = await this.installUnzipped(unzipTmp);
+    // A download delivers the COMPLETE dataset: replace whatever an older
+    // import/download round left behind (the import flow merges instead).
+    const ok = await this.installUnzipped(unzipTmp, true);
     if (!ok) {
       this.bootState = 2;
       this.progressValue = 0;
@@ -1100,6 +1456,55 @@ struct Index {
         }
       });
     });
+  }
+
+  /** Pre-flight free-space probe. The full download+extract pipeline needs
+   * roughly twice the archive total at peak (a finished zip is extracted
+   * into the staging dir and then deleted, but both exist side by side
+   * meanwhile). Emulators and small tablets ship tiny data partitions - the
+   * observed failure was a download dying mid-pack with 13900025 once the
+   * 6GB emulator data disk filled up. Fail BEFORE pulling gigabytes, with
+   * a readable message. Returns '' when there is enough room, otherwise a
+   * user-facing error string. */
+  private async checkFreeSpace(path: string, needBytes: number): Promise<string> {
+    try {
+      // Free space via the native statvfs bridge: @ohos.file.statfs is not
+      // present in the API 12 OpenHarmony SDK declarations and fs.statfs
+      // only exists on newer API levels than compileSdkVersion 12.
+      const freeBytes = entryNapi.freeDiskSpace(path) as number;
+      this.log('free space at ' + path + ': ' + this.fmtSize(freeBytes) +
+        ' avail, need ' + this.fmtSize(needBytes));
+      if (freeBytes >= 0 && freeBytes < needBytes) {
+        try {
+          entryNapi.diagLog('shell: LOW SPACE ' + this.fmtSize(freeBytes) +
+            ' free, need ' + this.fmtSize(needBytes));
+        } catch (eDg) {
+          // diag channel not ready
+        }
+        return '设备剩余空间仅 ' + this.fmtSize(freeBytes) + '，而完整下载并解压需要约 ' +
+          this.fmtSize(needBytes) + '，请清理空间后重试（模拟器请在设备管理器把数据分区调大）';
+      }
+    } catch (e) {
+      // statfs unavailable on this path - never block the download on it
+      this.log('statfs probe failed: ' + JSON.stringify(e));
+    }
+    return '';
+  }
+
+  /** Map common fs error codes from the write path to readable text
+   * (returns '' when the error is not a recognised fs code). */
+  private describeFsError(e: Error): string {
+    const t = JSON.stringify(e);
+    if (t.indexOf('13900025') >= 0 || t.indexOf('13900028') >= 0) {
+      return '写入失败：磁盘空间不足';
+    }
+    if (t.indexOf('13900013') >= 0 || t.indexOf('13900001') >= 0) {
+      return '写入失败：没有访问权限';
+    }
+    if (t.indexOf('13900002') >= 0) {
+      return '写入失败：目标目录不存在';
+    }
+    return '';
   }
 
   async downloadFile(url: string, dest: string, totalSize: number,
@@ -1250,6 +1655,21 @@ struct Index {
     }
   }
 
+  /** Show/refresh the extract progress bar (its own track above the
+   *  download bar) while a decompression is running. */
+  private showExtractBar(text: string, value: number): void {
+    this.extractText = text;
+    this.extractValue = Math.max(0, Math.min(100, value));
+    this.extractVisible = true;
+  }
+
+  /** The extract bar disappears once extraction is done. */
+  private hideExtractBar(): void {
+    this.extractVisible = false;
+    this.extractValue = 0;
+    this.extractText = '';
+  }
+
   /** True only when the Windows krkrz-style root contains data.xp3, or
    *  when a complete loose data tree exists in <base>/data/. */
   dataReady(): boolean {
@@ -1301,11 +1721,15 @@ struct Index {
    *  - "data/" folder  -> becomes the public loose tree
    *  - "data.xp3"      -> handed to the native extractor
    *  - bare tree       -> the staging dir itself becomes the loose tree
-   *  Returns true when game data is ready. The staging dir lives in the
+   *  With replace=true (the download flow installs a COMPLETE dataset) the
+   *  staging tree REPLACES the data folder. With replace=false (the local
+   *  import flow) the staging tree is MERGED into the existing data folder
+   *  instead: archives arrive one at a time and must accumulate. Returns
+   *  true when a game data payload was found. The staging dir lives in the
    *  sandbox (decompressFile requires sandbox paths) while the data tree
-   *  lives in the public folder - the swap therefore crosses volumes and
+   *  lives in the public folder - the move therefore crosses volumes and
    *  falls back to a copy+delete move when the atomic rename fails. */
-  private async installUnzipped(unzipTmp: string): Promise<boolean> {
+  private async installUnzipped(unzipTmp: string, replace: boolean): Promise<boolean> {
     await this.startExtractTask();
     try {
     const items = this.tryList(unzipTmp);
@@ -1384,7 +1808,14 @@ struct Index {
       this.uiEpoch++;
     };
     if (this.isDir(unzipTmp + '/data')) {
-      await swapIn(unzipTmp + '/data');
+      if (replace) {
+        await swapIn(unzipTmp + '/data');
+      } else {
+        // Accumulative import: MERGE instead of replacing so archives
+        // extracted in earlier rounds survive; the caller runs the
+        // completeness gate (finishImport) afterwards.
+        await this.mergeIn(unzipTmp + '/data');
+      }
       await taskpool.execute(removeTreeTask, unzipTmp);
       return true;
     } else if (items.indexOf('data.xp3') >= 0) {
@@ -1399,12 +1830,266 @@ struct Index {
       await this.extractAndFinalize(this.baseDir + '/data.xp3');
       return true;
     } else if (items.indexOf('startup.tjs') >= 0) {
-      await swapIn(unzipTmp);
+      if (replace) {
+        await swapIn(unzipTmp);
+      } else {
+        await this.mergeIn(unzipTmp);
+      }
       return true;
     }
     return false;
     } finally {
       await this.stopExtractTask();
+    }
+  }
+
+  /** Merge a freshly extracted staging tree into the public data folder
+   *  WITHOUT wiping what previous import rounds already put there
+   *  (accumulative multi-archive imports). Same cross-volume copy path
+   *  and live progress bar as the move inside swapIn. */
+  private async mergeIn(src: string): Promise<void> {
+    this.progressText = '正在合并数据到下载目录…';
+    this.progressValue = 0;
+    this.uiEpoch++;
+    // Pre-create the destination directory on the UI thread: the sharefs
+    // (KaihongOS) rw mount may reject mkdir calls made from the TaskPool
+    // worker, which silently breaks every copy below.
+    try {
+      fs.mkdirSync(this.dataDir, true);
+    } catch (e) {
+      // already exists or the mount is not writable
+    }
+    if (!this.tryDirectAt(this.appDir)) {
+      throw new Error('数据目录不可写：' + this.lastDirectError + '（授权已失效，请重新选择文件夹）');
+    }
+    const progressPath = src + '.move.progress';
+    const movePromise = taskpool.execute(mergeTreeTask, src, this.dataDir);
+    let moved = 0;
+    let total = 0;
+    while (true) {
+      await this.delay(500);
+      const pg = this.tryReadFile(progressPath);
+      if (pg.indexOf('DONE') >= 0) {
+        break;
+      }
+      const parts = pg.trim().split(' ');
+      if (parts.length >= 2) {
+        const pd = Number(parts[0]);
+        const pt = Number(parts[1]);
+        if (isFinite(pd) && isFinite(pt) && pd >= 0 && pt > 0) {
+          moved = pd;
+          total = pt;
+          this.progressValue = Math.floor(moved * 100 / total);
+          this.progressText = '正在合并数据到下载目录：' + moved + ' / ' + total;
+        }
+      }
+    }
+    await movePromise;
+    // Persist any per-file copy failures for diagnosis (the staging dir
+    // is removed right after, so this copy survives).
+    const errText = this.tryReadFile(src + '.move.err');
+    if (errText !== '') {
+      try {
+        const diagFd = fs.openSync(this.sandboxFiles + '/move.diag',
+          fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+        fs.writeSync(diagFd.fd, errText);
+        fs.closeSync(diagFd);
+      } catch (e) {
+        // ignore
+      }
+    }
+    try {
+      fs.unlinkSync(progressPath);
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  /** Archive numbers already recorded next to the data folder, parsed
+   *  from the data-assets-<N>.json file names, ascending. */
+  private listImportedPackIndexes(): number[] {
+    const out: number[] = [];
+    const entries = this.tryList(this.baseDir);
+    for (const name of entries) {
+      if (name.startsWith('data-assets-') && name.endsWith('.json')) {
+        const numPart = name.substring('data-assets-'.length,
+          name.length - '.json'.length);
+        const n = Number(numPart);
+        if (Number.isFinite(n) && n > 0 && String(n) === numPart && out.indexOf(n) < 0) {
+          out.push(n);
+        }
+      }
+    }
+    out.sort((a: number, b: number): number => a - b);
+    return out;
+  }
+
+  /** Pick up the in-pack manifest an archive just dropped at
+   *  <stagingRoot>/data-assets.json (the zip ROOT entry, extracted NEXT to
+   *  the data/... tree) and record it as <baseDir>/data-assets-<N>.json.
+   *  Must run right after each unzipTo: a later archive would otherwise
+   *  overwrite the manifest copy inside the shared staging dir. Returns
+   *  the pack index; 0 when the archive carries no manifest (legacy pack /
+   *  single complete pack); -1 for an already-imported pack (duplicate
+   *  copy dropped, user notified). */
+  private async processPackManifest(stagingRoot: string): Promise<number> {
+    const entries = this.tryList(stagingRoot);
+    if (entries.indexOf('data-assets.json') < 0) {
+      return 0;
+    }
+    const src = stagingRoot + '/data-assets.json';
+    let pm: PackManifest | null = null;
+    try {
+      pm = JSON.parse(this.tryReadFile(src)) as PackManifest;
+    } catch (e) {
+      pm = null;
+    }
+    if (pm === null || !(pm.packIndex > 0)) {
+      // Not a valid in-pack manifest: drop it to keep the data tree clean.
+      try {
+        fs.unlinkSync(src);
+      } catch (e) {
+        // ignore
+      }
+      return 0;
+    }
+    const index = Math.floor(pm.packIndex);
+    if (pm.packCount > this.importPackCount) {
+      this.importPackCount = Math.floor(pm.packCount);
+    }
+    const recordName = 'data-assets-' + index + '.json';
+    if (this.tryList(this.baseDir).indexOf(recordName) >= 0) {
+      this.message = '第 ' + index + ' 个压缩包已导入过，请导入其他压缩包';
+      this.uiEpoch++;
+      try {
+        fs.unlinkSync(src);
+      } catch (e) {
+        // ignore
+      }
+      return -1;
+    }
+    const record = this.baseDir + '/' + recordName;
+    try {
+      fs.renameSync(src, record);
+    } catch (e) {
+      // cross-volume (staging sandbox -> public folder): copy + delete
+      try {
+        fs.copyFileSync(src, record);
+        fs.unlinkSync(src);
+      } catch (e2) {
+        // leave the manifest in place; the gate treats this pack as missing
+      }
+    }
+    return index;
+  }
+
+  /** Total number of files a COMPLETE dataset contains, from the fetched
+   *  manifest: its dedicated fileTotal field, or the summed per-asset
+   *  fileCount on older releases. 0 when no manifest is available. */
+  private resolveFileTotal(): number {
+    if (this.manifest !== null) {
+      if (this.manifest.fileTotal !== undefined && this.manifest.fileTotal > 0) {
+        return this.manifest.fileTotal;
+      }
+      let sum = 0;
+      for (const a of this.assets) {
+        sum += a.fileCount;
+      }
+      if (sum > 0) {
+        return sum;
+      }
+    }
+    return 0;
+  }
+
+  /** Recursive file count under a directory: the completeness yardstick
+   *  for legacy archives without an in-pack manifest. */
+  private countFiles(dir: string): number {
+    let entries: string[] = [];
+    try {
+      entries = fs.listFileSync(dir);
+    } catch (e) {
+      return 0;
+    }
+    let n = 0;
+    for (const name of entries) {
+      const child = dir + '/' + name;
+      try {
+        if (fs.statSync(child).isDirectory()) {
+          n += this.countFiles(child);
+        } else {
+          n++;
+        }
+      } catch (e) {
+        // ignore
+      }
+    }
+    return n;
+  }
+
+  /** The release's total archive count: the highest packCount seen in
+   *  THIS import round or inside any previously stored record. */
+  private resolveImportPackCount(): number {
+    let best = this.importPackCount;
+    for (const n of this.listImportedPackIndexes()) {
+      try {
+        const pm = JSON.parse(this.tryReadFile(this.baseDir + '/data-assets-' + n + '.json')) as PackManifest;
+        if (pm !== null && pm.packCount > best) {
+          best = Math.floor(pm.packCount);
+        }
+      } catch (e) {
+        // unreadable record: skip
+      }
+    }
+    return best;
+  }
+
+  /** Post-import completeness gate (mirrors Android/iOS). Archives WITH
+   *  an in-pack manifest are tracked through data-assets-<N>.json records
+   *  next to the data folder: the game starts only once EVERY archive is
+   *  in, and the user is told the exact missing numbers otherwise. Legacy
+   *  archives fall back to hasLooseData / the manifest fileTotal. */
+  private async finishImport(): Promise<void> {
+    const imported = this.listImportedPackIndexes();
+    const packCount = this.resolveImportPackCount();
+    if (imported.length > 0 && packCount > 0) {
+      if (imported.length >= packCount) {
+        // Every archive of the release is in: run the normal startup flow.
+        this.message = '';
+        this.finishData();
+        return;
+      }
+      const have: Set<number> = new Set<number>(imported);
+      const missing: number[] = [];
+      for (let n = 1; n <= packCount; n++) {
+        if (!have.has(n)) {
+          missing.push(n);
+        }
+      }
+      this.bootState = 2;
+      this.progressValue = 0;
+      this.uiEpoch++;
+      this.message = '数据包不完整：已导入 ' + imported.length + '/' + packCount
+        + ' 个压缩包，还需导入 ' + missing.length + ' 个，编号：' + missing.join('、');
+      return;
+    }
+    // No in-pack manifests: a legacy single complete pack or an old
+    // multi-part release. A loose startup.tjs + system folder means the
+    // data is usable as-is.
+    if (this.hasLooseData()) {
+      this.message = '';
+      this.finishData();
+      return;
+    }
+    const fileTotal = this.resolveFileTotal();
+    this.bootState = 2;
+    this.progressValue = 0;
+    this.uiEpoch++;
+    if (fileTotal > 0) {
+      const have = this.countFiles(this.dataDir);
+      this.message = '数据包不完整：已解压 ' + have + '/' + fileTotal + ' 个文件，请继续导入其余压缩包';
+    } else {
+      this.message = '数据包不完整（该压缩包不含导入进度信息），请继续导入其余压缩包';
     }
   }
 
@@ -1566,6 +2251,8 @@ struct Index {
     this.bootState = 4;
     this.message = '';
     this.progressText = '正在导入，请稍等';
+    // Fresh completeness state for THIS import round.
+    this.importPackCount = 0;
     const documentPicker = new picker.DocumentViewPicker(getContext(this) as common.UIAbilityContext);
     const cacheDir = this.sandboxFiles + '/cache';
     try {
@@ -1629,6 +2316,12 @@ struct Index {
               // ignore
             }
             zipCount++;
+            // Extract the archive's in-pack manifest RIGHT NOW: a later
+            // archive unzipped into the same staging dir would overwrite
+            // its data-assets.json. The manifest is renamed into
+            // <baseDir>/data-assets-<N>.json (or dropped when this pack
+            // was already imported).
+            await this.processPackManifest(staging);
           } else if (lower.endsWith('.7z') || lower.endsWith('.001') || lower.endsWith('.002')) {
             await this.showNotice('暂不支持 7z 格式', '请选择 zip 压缩包或 data.xp3 文件');
             continue;
@@ -1658,13 +2351,17 @@ struct Index {
       }
       this.progressText = '正在合并安装已添加的 ' + zipCount + ' 个压缩包…';
       this.uiEpoch++;
-      const ok = await this.installUnzipped(staging);
+      // Accumulative install: merge into the existing data folder, then
+      // run the completeness gate (missing archive numbers / startup).
+      const ok = await this.installUnzipped(staging, false);
       if (!ok) {
         this.bootState = 2;
         this.progressValue = 0;
         this.uiEpoch++;
         this.message = '压缩包内容不正确：未找到 data 文件夹或 data.xp3，请重新选择或下载';
         await this.showNotice('数据不完整', '请检查压缩包是否包含 data 文件夹或 data.xp3 文件');
+      } else {
+        await this.finishImport();
       }
       return;
     }
@@ -1744,14 +2441,24 @@ struct Index {
         } catch (e) {
           // ignore
         }
+        // Extract the archive's in-pack manifest RIGHT NOW: archives
+        // unzipped into the same staging dir would overwrite each other's
+        // data-assets.json. It is renamed into
+        // <baseDir>/data-assets-<N>.json (or dropped when this pack was
+        // already imported).
+        await this.processPackManifest(unzipTmp);
       }
-      const ok = await this.installUnzipped(unzipTmp);
+      // Accumulative install: merge into the existing data folder, then
+      // run the completeness gate (missing archive numbers / startup).
+      const ok = await this.installUnzipped(unzipTmp, false);
       if (!ok) {
         this.bootState = 2;
         this.progressValue = 0;
         this.uiEpoch++;
         this.message = '压缩包内容不正确：未找到 data 文件夹或 data.xp3，请重新选择或下载';
         await this.showNotice('数据不完整', '请检查压缩包是否包含 data 文件夹或 data.xp3 文件');
+      } else {
+        await this.finishImport();
       }
       return;
     }
@@ -1796,6 +2503,7 @@ struct Index {
     this.bootState = 7;
     this.progressText = '正在解包 data.xp3…';
     this.progressValue = 0;
+    this.showExtractBar('正在解包 data.xp3…', 0);
     this.message = '';
     this.uiEpoch++;
     this.log('extractAndFinalize begin: ' + xp3Path);
@@ -1896,12 +2604,15 @@ struct Index {
             if (isFinite(pd) && isFinite(pt) && pd >= 0 && pt > 0) {
               done = pd;
               total = pt;
-              this.progressValue = Math.floor(done * 100 / total);
-              this.progressText = '正在解包 data.xp3：' + done + ' / ' + total + ' 个文件';
+              this.showExtractBar('正在解包 data.xp3：' + done + ' / ' + total + ' 个文件',
+                Math.floor(done * 100 / total));
             }
           }
         }
       }
+      // Unpack finished: the extract bar disappears, the main bar takes
+      // over for the (quick) swap-in phase.
+      this.hideExtractBar();
       // Swap the extracted tree in, replacing ANY previous data tree
       // (partial or complete) - rename fails when the target exists.
       if (this.tryList(this.baseDir).indexOf('data') >= 0) {
@@ -1954,6 +2665,9 @@ struct Index {
       this.log('extractAndFinalize failed: ' + this.errText(e));
     } finally {
       await this.stopExtractTask();
+      // Every exit path (success, unpack error, native start failure)
+      // clears the extract bar here.
+      this.hideExtractBar();
       this.extracting = false;
     }
   }
@@ -2004,6 +2718,13 @@ struct Index {
         return;
       }
       this.readyForGame = true;
+      // The import-progress records (data-assets-<N>.json) have done their
+      // job once the dataset is complete: drop them (and any leftover
+      // in-pack manifest) so a re-import after an app UPDATE is not
+      // rejected with "第 N 个压缩包已导入过" - the records survive an
+      // update install because the app data folder is preserved.
+      this.clearPackRecords();
+      this.writeNomediaTree();
       // Record that THIS app version already confirmed the current data,
       // so an app update asks again exactly once.
       this.writeTextFile(this.sandboxFiles + '/data_confirm.txt',
@@ -2026,6 +2747,22 @@ struct Index {
     this.progressValue = 0;
     this.message = '压缩包内容不正确：未找到 data 文件夹或 data.xp3，请重新选择或下载';
     this.showNotice('数据不完整', '请检查压缩包是否包含 data 文件夹或 data.xp3 文件');
+  }
+
+  /** Drop the import-progress records once the dataset is complete: they
+   *  only back the completeness gate during an import round, and stale
+   *  records surviving an app update would block a fresh re-import. */
+  private clearPackRecords(): void {
+    for (const name of this.tryList(this.baseDir)) {
+      if (name === 'data-assets.json' ||
+        (name.startsWith('data-assets-') && name.endsWith('.json'))) {
+        try {
+          fs.unlinkSync(this.baseDir + '/' + name);
+        } catch (e) {
+          // ignore
+        }
+      }
+    }
   }
 
   delay(ms: number): Promise<void> {
@@ -2105,6 +2842,72 @@ struct Index {
     this.hoverProxy = isHover ? proxy : (this.hoverProxy === proxy ? 0 : this.hoverProxy);
   }
 
+  /* Fit the largest 16:9 rectangle inside the given WINDOW size and store
+   * it as the shared game/bootstrap canvas. Only ever called from the root
+   * stack's onAreaChange (which is always 100% x 100% of the window), never
+   * from a fitted component itself. */
+  /** Vertical offset for the bootstrap control stacks: the background
+   *  artwork is Contain-fitted and CENTERED in the root stack, while the
+   *  control stacks top-align inside the wrapping Column - on non-16:9
+   *  windows they sit above the artwork by exactly the TOP black bar.
+   *  Phones have no bar (fullscreen 16:9) and get 0. Falls back to the
+   *  PC-tuned 37vp while the window size is not yet known. */
+  private bootStackOffsetY(): number {
+    if (this.rootWpx <= 0 || this.rootHpx <= 0) {
+      return 37;
+    }
+    // Contain-fit height of the 16:9 artwork inside the root stack, then
+    // the TOP black bar from centering it vertically.
+    const imgHpx = Math.min(this.rootWpx * 9 / 16, this.rootHpx);
+    const barPx = (this.rootHpx - imgHpx) / 2;
+    if (barPx <= 0) {
+      return 0;
+    }
+    return px2vp(barPx);
+  }
+
+  private fitGameCanvas(stageW: number, stageH: number): void {
+    if (stageW > 0 && stageH > 0) {
+      let gw: number = stageW;
+      let gh: number = stageW * 9 / 16;
+      if (gh > stageH) {
+        gh = stageH;
+        gw = stageH * 16 / 9;
+      }
+      this.gameW = Math.floor(gw);
+      this.gameH = Math.floor(gh);
+    }
+  }
+
+  /* Touch/mouse mapping helpers. PC/tablet (fixed virtual surface): window
+   * px -> game surface px via the centred transform; the native side then
+   * maps surface px 1:1 onto the 1920x1080 logical window (g_physical equals
+   * the fixed surface size, so its scaling is an identity). Phones: pass the
+   * raw fitted-surface px through unchanged (native scales from it). */
+  private gameOffsetX(): number {
+    return (this.rootWpx - GAME_VIRTUAL_W_PX * this.gameScale) / 2;
+  }
+
+  private gameOffsetY(): number {
+    return (this.rootHpx - GAME_VIRTUAL_H_PX * this.gameScale) / 2;
+  }
+
+  private mapTouchX(xVp: number): number {
+    const px = vp2px(xVp);
+    if (this.gameFillsWindow && this.gameScale > 0) {
+      return (px - this.gameOffsetX()) / this.gameScale;
+    }
+    return px;
+  }
+
+  private mapTouchY(yVp: number): number {
+    const px = vp2px(yVp);
+    if (this.gameFillsWindow && this.gameScale > 0) {
+      return (px - this.gameOffsetY()) / this.gameScale;
+    }
+    return px;
+  }
+
   build() {
     Stack({ alignContent: Alignment.Center }) {
       // Title background image shipped inside the HAP (rawfile); only on
@@ -2145,6 +2948,7 @@ struct Index {
                   this.log('getXComponentSurfaceId failed: ' + JSON.stringify(e3));
                 }
                 this.log('onLoad surfaceId=' + sid);
+                this.xcSurfaceId = sid;
                 entryNapi.setSurfaceId(sid);
                 this.log('XComponent onLoad native-attach done');
                 const ok: boolean = entryNapi.onLoad(context) as boolean;
@@ -2172,10 +2976,19 @@ struct Index {
                 this.log('onLoad exception: ' + JSON.stringify(e));
               }
             })
-            // Full-screen height with 16:9 aspect: the video fills the
-            // screen top-to-bottom and letterboxes on the sides only.
-            .height('100%')
-            .aspectRatio(16 / 9)
+            // PC/tablet: FIXED virtual-resolution surface (1920x1080
+            // physical px) fitted with a GPU .scale transform. The surface
+            // never resizes on window changes - real-device forensics showed
+            // ArkUI crashes in its own surface-resize path on HarmonyOS PC
+            // regardless of the render thread, so resizes must only ever
+            // change this transform. PHONES: the original v1.0.4 fitted
+            // 16:9 canvas (gameW/gameH from fitGameCanvas, black bars
+            // left/right), confirmed stable on a real phone in v1.0.8.
+            .width(this.gameFillsWindow ? px2vp(GAME_VIRTUAL_W_PX) : this.gameW)
+            .height(this.gameFillsWindow ? px2vp(GAME_VIRTUAL_H_PX) : this.gameH)
+            .scale(this.gameFillsWindow
+              ? { x: this.gameScale, y: this.gameScale }
+              : { x: 1, y: 1 })
             // Report the real component size to the engine: the native
             // OnSurfaceChanged callback never fires on this system, so
             // without this the SDL window size stays at the fallback and
@@ -2185,6 +2998,22 @@ struct Index {
                 const w = newValue.width as number;
                 const h = newValue.height as number;
                 if (w > 0 && h > 0) {
+                  // Deduplicate no-change callbacks. v1.0.9 real-device diag
+                  // shows ArkUI firing this callback every ~8ms with CONSTANT
+                  // values after a fullscreen switch (hundreds of repeats);
+                  // each fire did a napi call + diag file IO on the UI thread
+                  // and starved input processing - the user-visible symptom
+                  // was "the resolution options won't respond". With the
+                  // fixed virtual-resolution surface the size genuinely never
+                  // changes, so identical values carry no information.
+                  const pxW = vp2px(w);
+                  const pxH = vp2px(h);
+                  if (Math.abs(pxW - this.lastXcPxW) < 0.5 &&
+                    Math.abs(pxH - this.lastXcPxH) < 0.5) {
+                    return;
+                  }
+                  this.lastXcPxW = pxW;
+                  this.lastXcPxH = pxH;
                   // Record the real component pixel size. This is used ONLY to
                   // scale touch coordinates from the physical XComponent space
                   // into the game's logical window space (1920x1080). The SDL
@@ -2192,8 +3021,22 @@ struct Index {
                   // resizing it to the physical size made the game crash
                   // ("Scan line 0 is range over (0 to -1)") because layers are
                   // laid out in the 1920x1080 coordinate system.
-                  entryNapi.setSurfaceSize(vp2px(w), vp2px(h));
-                  this.log('XComponent size: ' + vp2px(w).toFixed(0) + 'x' + vp2px(h).toFixed(0) + ' px');
+                  //
+                  // NOTE: do NOT call xcController.getXComponentSurfaceId()
+                  // here. Probing the surface id on every layout change
+                  // crashes ArkUI (libace_compatible SIGSEGV, fault addr=0)
+                  // while the window is mid-transition - the crash handler
+                  // caught exactly that stack on 37103/37105. The surface id
+                  // is delivered once via onLoad; the SDL driver handles
+                  // buffer resizes by reading the live buffer geometry.
+                  entryNapi.setSurfaceSize(pxW, pxH);
+                  this.log('XComponent size: ' + pxW.toFixed(0) + 'x' + pxH.toFixed(0) + ' px');
+                  try {
+                    entryNapi.diagLog('xc: game area=' + w.toFixed(0) + 'x' + h.toFixed(0) +
+                      ' vp (' + pxW.toFixed(0) + 'x' + pxH.toFixed(0) + ' px)');
+                  } catch (eDg) {
+                    // diag channel not ready yet
+                  }
                 }
               } catch (e) {
                 this.log('onAreaChange exception: ' + JSON.stringify(e));
@@ -2225,8 +3068,10 @@ struct Index {
                   this.log('video onLoad exception: ' + JSON.stringify(e));
                 }
               })
-              .height('100%')
-              .aspectRatio(16 / 9)
+              // Same fitted 16:9 canvas as the game surface (16:9 movies
+              // then exactly cover the game picture).
+              .width(this.gameW)
+              .height(this.gameH)
               .zIndex(3)
             }
             // No .onTouch here: libace_compatible crashes the UI thread while
@@ -2237,10 +3082,14 @@ struct Index {
           // itself never receives them (libace_compatible crashes processing
           // XComponent touches). Forward to the SDL backend via napi.
           Column()
-            // Same size as the XComponent so overlay vp coords map directly
-            // onto the SDL window coordinate space.
-            .height('100%')
-            .aspectRatio(16 / 9)
+            // Overlay matches the game surface's layout policy: PC/tablet
+            // fill the window (touch px coords then line up with the surface
+            // px space the engine scales from, edge letterbox included);
+            // phones match the fitted 16:9 canvas so touches over the black
+            // bars land outside the 0..1920/0..1080 logical range instead of
+            // being stretched across the whole picture.
+            .width(this.gameFillsWindow ? '100%' : this.gameW)
+            .height(this.gameFillsWindow ? '100%' : this.gameH)
             .backgroundColor('#00000000')
             .zIndex(4)
             .onTouch((event: TouchEvent) => {
@@ -2255,10 +3104,10 @@ struct Index {
                   // emulate the finger tap exactly: sendTouch.
                   if (event.type === TouchType.Down) {
                     const mt = event.touches[0];
-                    if (mt) entryNapi.sendTouch(0, vp2px(mt.x), vp2px(mt.y));
+                    if (mt) entryNapi.sendTouch(0, this.mapTouchX(mt.x), this.mapTouchY(mt.y));
                   } else if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
                     const mt = event.touches[0];
-                    if (mt) entryNapi.sendTouch(1, vp2px(mt.x), vp2px(mt.y));
+                    if (mt) entryNapi.sendTouch(1, this.mapTouchX(mt.x), this.mapTouchY(mt.y));
                   }
                   return;
                 }
@@ -2272,7 +3121,7 @@ struct Index {
                 // advances text, skips the logo movie).
                 const t = event.touches[0];
                 if (t) {
-                  entryNapi.sendTouch(type, vp2px(t.x), vp2px(t.y));
+                  entryNapi.sendTouch(type, this.mapTouchX(t.x), this.mapTouchY(t.y));
                 }
                 // EVERY finger must reach SDL as a FINGER event: the engine
                 // maps a two-finger tap onto the right mouse button, which
@@ -2282,7 +3131,7 @@ struct Index {
                 const changed = event.changedTouches;
                 for (let i = 0; i < changed.length; i++) {
                   const f = changed[i];
-                  entryNapi.sendFinger(type, f.id, vp2px(f.x), vp2px(f.y));
+                  entryNapi.sendFinger(type, f.id, this.mapTouchX(f.x), this.mapTouchY(f.y));
                 }
               } catch (e) {
                 this.log('overlay onTouch exception: ' + JSON.stringify(e));
@@ -2296,11 +3145,11 @@ struct Index {
                   // LEFT button skipped here (phones deliver it as a touch-source
                   // event handled in onTouch); right/middle buttons stay on
                   // this ArkUI mouse callback, as do move/hover.
-                  if (b !== 1) { entryNapi.sendMouse(0, b, vp2px(event.x), vp2px(event.y)); }
+                  if (b !== 1) { entryNapi.sendMouse(0, b, this.mapTouchX(event.x), this.mapTouchY(event.y)); }
                 } else if (event.action === MouseAction.Release) {
-                  if (b !== 1) { entryNapi.sendMouse(1, b, vp2px(event.x), vp2px(event.y)); }
+                  if (b !== 1) { entryNapi.sendMouse(1, b, this.mapTouchX(event.x), this.mapTouchY(event.y)); }
                 } else if (event.action === MouseAction.Move || event.action === MouseAction.Hover) {
-                  entryNapi.sendMouse(3, b, vp2px(event.x), vp2px(event.y));
+                  entryNapi.sendMouse(3, b, this.mapTouchX(event.x), this.mapTouchY(event.y));
                 }
               } catch (e) {
                 // ignore malformed events
@@ -2309,6 +3158,8 @@ struct Index {
         }
         .width('100%')
         .height('100%')
+        // Letterbox: black bars around the fitted 16:9 canvas.
+        .backgroundColor('#000000')
       } else if (this.bootState === 2) {
         // The setup controls use the same 16:9 canvas as Background.png.
         // Percent positions are relative to that canvas, so controls stay
@@ -2433,7 +3284,18 @@ struct Index {
               this.importLocal();
             })
         }
-        .height('100%').aspectRatio(16 / 9)
+        // Fitted 16:9 canvas, sized by the root stack (transparent so the
+        // bootstrap artwork stays visible around it). PC/tablet non-16:9
+        // windows: the background Contain content sits ~50vp below the
+        // stack's origin - shift the controls (render + hit-test) down to
+        // line up with the artwork.
+        .width(this.gameW)
+        .height(this.gameH)
+        // PC/tablet: the artwork sits barVp below the stack origin (root
+        // stack centers the Contain image, the Column top-aligns this
+        // stack) - shift down by the top bar. Phones: fullscreen 16:9,
+        // no bar, 0.
+        .translate({ x: 0, y: this.gameFillsWindow ? this.bootStackOffsetY() : 0 })
       } else if (this.bootState === 3 || this.bootState === 4 || this.bootState === 7) {
         // Keep the same artwork during download/import and overlay the live
         // progress control on the supplied center track. This makes the
@@ -2474,6 +3336,22 @@ struct Index {
             .width((this.progressValue * 0.6286).toFixed(2) + '%').height('1.67%')
             .position({ x: '11.15%', y: '64.26%' })
             .backgroundColor('#1783FF').borderRadius(9)
+          if (this.extractVisible) {
+            // Second (extract) progress bar, stacked directly above the
+            // download bar; green so the two are easy to tell apart.
+            Text(this.extractText).width('63.28%').height('3.2%')
+              .position({ x: '10.94%', y: '58.35%' })
+              .fontSize(15).fontColor('#C8E6C9').maxLines(1)
+              .textAlign(TextAlign.Center)
+            Image($rawfile('progress_track.png'))
+              .width('63.28%').height('2.41%')
+              .position({ x: '10.94%', y: '61.3%' })
+              .objectFit(ImageFit.Fill)
+            Column()
+              .width((this.extractValue * 0.6286).toFixed(2) + '%').height('1.67%')
+              .position({ x: '11.15%', y: '61.67%' })
+              .backgroundColor('#4CAF50').borderRadius(9)
+          }
           if (this.activeAction === 1) {
             Image($rawfile('download_label_active.png'))
               .width('7.08%').height('5.28%')
@@ -2497,7 +3375,11 @@ struct Index {
             .fontSize(18).fontColor(Color.White).maxLines(3)
             .textAlign(TextAlign.Center)
         }
-        .height('100%').aspectRatio(16 / 9)
+        // Fitted 16:9 canvas, sized by the root stack (same rule). Same
+        // non-16:9 compensation as the setup screen above.
+        .width(this.gameW)
+        .height(this.gameH)
+        .translate({ x: 0, y: this.gameFillsWindow ? this.bootStackOffsetY() : 0 })
       } else {
         Column({ space: 14 }) {
           Text('需要授权').fontSize(18).fontColor(Color.White)
@@ -2519,6 +3401,27 @@ struct Index {
     .key('boot-' + this.bootState + '-' + this.uiEpoch)
     .width('100%')
     .height('100%')
+    // Single driver for the fitted 16:9 canvas: this root stack always
+    // spans the whole window, so its area IS the window size (fixes both
+    // the self-referencing lock at 1280x720 and the collapsed canvas that
+    // misplaced the bootstrap buttons).
+    .onAreaChange((oldRoot: Area, newRoot: Area) => {
+      this.fitGameCanvas(newRoot.width as number, newRoot.height as number);
+      if (this.gameFillsWindow) {
+        // PC/tablet: the game surface is fixed-size; only this transform
+        // follows the window. Touch mapping uses the same numbers.
+        const rw = vp2px(newRoot.width as number);
+        const rh = vp2px(newRoot.height as number);
+        if (rw > 0 && rh > 0) {
+          this.rootWpx = rw;
+          this.rootHpx = rh;
+          const k = Math.min(rw / GAME_VIRTUAL_W_PX, rh / GAME_VIRTUAL_H_PX);
+          if (k > 0 && Math.abs(k - this.gameScale) > 0.0001) {
+            this.gameScale = k;
+          }
+        }
+      }
+    })
     .backgroundColor('#000000')
     .expandSafeArea([SafeAreaType.SYSTEM])
     .focusable(true)

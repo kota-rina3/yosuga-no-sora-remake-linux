@@ -247,6 +247,25 @@ int OHOS_GL_SwapWindow(_THIS, SDL_Window *window)
 	{
 		return SDL_SetError("Window has no driver data");
 	}
+	/* Keep the buffer geometry pinned to the SDL window (the game logical
+	 * resolution, 1920x1080). When the OS window resizes (maximize button,
+	 * fullscreen switch on HarmonyOS PC / 2-in-1 tablets) ArkUI re-sizes the
+	 * XComponent surface and with it the native window buffer geometry; the
+	 * GL viewport would then still cover only the old logical rectangle and
+	 * the picture ends up as a small block in the bottom-left corner with
+	 * black around it. Re-asserting the geometry every frame is a no-op
+	 * while it already matches and re-pins it the moment the surface was
+	 * resized; the compositor stretches the logical buffer into the 16:9
+	 * XComponent surface exactly like it does on phones. */
+	{
+		OHNativeWindow *native_window = (OHNativeWindow *)SDL_OHOS_GetNativeWindow();
+		if (native_window != NULL)
+		{
+			int gw = window->w > 0 ? window->w : 1920;
+			int gh = window->h > 0 ? window->h : 1080;
+			OH_NativeWindow_NativeWindowHandleOpt(native_window, SET_BUFFER_GEOMETRY, gw, gh);
+		}
+	}
 	{
 		static int swap_count = 0;
 		if (++swap_count <= 5 || swap_count % 300 == 0)

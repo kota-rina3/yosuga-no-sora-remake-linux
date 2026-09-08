@@ -454,7 +454,6 @@ list(APPEND KRKRSDL2_LIBS
 	"-framework AudioToolbox"
 	"-framework CoreMedia"
 	"-framework QuartzCore"
-	"-framework UniformTypeIdentifiers"
 )
 endif()
 

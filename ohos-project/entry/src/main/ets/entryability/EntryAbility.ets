@@ -35,6 +35,15 @@ export default class EntryAbility extends UIAbility {
       // hidden (no white status strip, no bottom black strip).
       mainWindow.setWindowLayoutFullScreen(true);
       mainWindow.setWindowSystemBarEnable([]);
+      // NOTE: do NOT resize the window into a floating window at startup.
+      // On the HarmonyOS PC (2-in-1) Beta1 EMULATOR any window-size change
+      // that involves a floating window segfaults inside the ArkUI framework
+      // itself (libace_compatible.z.so +0x2b939d0, fault addr=0, UI thread,
+      // no app frames in the stack - captured by our crash handler on
+      // builds 37103..37106 across startup, maximize and restore paths).
+      // The maximized-window default is the only stable window mode on this
+      // system; the in-game fullscreen toggle stays functional as a
+      // compositor-level immersive switch.
     }).catch((err: Error) => {
       hilog.error(DOMAIN, TAG, 'Failed to configure main window: %{public}s', JSON.stringify(err));
     });

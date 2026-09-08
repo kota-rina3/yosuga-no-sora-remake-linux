@@ -244,12 +244,20 @@ jobs:
           IOS_BUILD_NUMBER: ${{ steps.release.outputs.version-code }}
           IOS_BUNDLE_IDENTIFIER: ${{ steps.release.outputs.bundle-identifier }}
           IOS_EMBED_DATA: 'OFF'
+          # Minimum supported release: iOS 13 (the UIScene lifecycle floor).
+          IOS_DEPLOYMENT_TARGET: '13.0'
         run: |
           set -euo pipefail
-          # Write the current repository's Release download root into the
-          # bundle so forks/renames track the right repo without editing code.
-          printf '{"baseUrl":"https://github.com/%s/releases/latest/download/","releaseTag":"%s"}\n' \
-            "${{ github.repository }}" "${{ steps.release.outputs.tag }}" \
+          # Write the current repository's data-source URL into the bundle
+          # so forks/renames track the right repo without editing code.
+          # /releases/latest/ skips prereleases and the data-vN releases are
+          # all prereleases, so resolve the newest data-vN tag explicitly.
+          data_tag=$(curl -fsSL -H "Authorization: Bearer ${{ github.token }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases?per_page=100" \
+            | python3 -c "import json,sys; rels=json.load(sys.stdin); tags=[r['tag_name'] for r in rels if not r.get('draft') and str(r.get('tag_name','')).startswith('data-v')]; print(tags[0] if tags else '')")
+          base_url="https://github.com/${{ github.repository }}/releases/download/${data_tag:-latest}/"
+          printf '{"baseUrl":"%s","releaseTag":"%s"}\n' \
+            "$base_url" "${{ steps.release.outputs.tag }}" \
             > src/resources/ios/default-manifest.json
           cat src/resources/ios/default-manifest.json
           ./ios-project/generate.sh
@@ -329,6 +337,10 @@ jobs:
             "$VERSION_NAME" ]]
           [[ "$(plutil -extract CFBundleVersion raw "$app/Info.plist")" == \
             "$VERSION_CODE" ]]
+          # Deployment-target floor: the IPA must keep its iOS 13 minimum
+          # (Xcode derives MinimumOSVersion from IPHONEOS_DEPLOYMENT_TARGET).
+          [[ "$(plutil -extract MinimumOSVersion raw "$app/Info.plist")" == \
+            '13.0' ]]
           if [[ "$SIGNED" == 'true' ]]; then
             [[ -f "$app/embedded.mobileprovision" ]]
             codesign --verify --deep --strict --verbose=2 "$app"

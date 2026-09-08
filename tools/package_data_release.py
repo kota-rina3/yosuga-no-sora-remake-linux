@@ -15,6 +15,18 @@ archives into the application data folder reproduces the original tree:
 
 data-assets.json (shipped inside the HAP) lists the archives, their sizes and
 SHA-256 hashes so the app can download them in order and verify integrity.
+
+Every archive ALSO carries its own copy of data-assets.json at the zip ROOT
+(next to the data/ folder) describing the in-pack progress state:
+
+    {"kind": "data-pack", "packIndex": N, "packCount": M,
+     "fileCount": <files in this archive>, "fileTotal": <complete dataset>}
+
+The on-device importers (Android/iOS/HarmonyOS/OpenHarmony) read it after
+extracting, rename it to data-assets-<packIndex>.json next to the data
+folder, and can then tell the user exactly which archive numbers are still
+missing - without any network access. Legacy archives without the in-pack
+manifest fall back to the release manifest's fileTotal / summed fileCount.
 """
 
 from __future__ import annotations
@@ -171,6 +183,11 @@ def main() -> int:
     if current:
         batches.append(current)
 
+    # Complete-dataset file total: every file shipped across ALL archives
+    # combined. Clients use it as the completeness yardstick for legacy
+    # archives that carry no in-pack manifest (see the import flows).
+    total_files = sum(len(files) for batch in batches for _, files in batch)
+
     args.out.mkdir(parents=True, exist_ok=True)
     compression = zipfile.ZIP_DEFLATED if args.compress_level > 0 else zipfile.ZIP_STORED
     assets = []
@@ -180,6 +197,17 @@ def main() -> int:
         file_count = 0
         for pack_id, files in batch:
             file_count += len(files)
+        # In-pack manifest written at the zip ROOT, NEXT to the data/
+        # folder. The on-device importer reads it after extracting to know
+        # WHICH archive it just installed (packIndex) and how many are
+        # still missing (packCount), without any network access.
+        pack_manifest = json.dumps({
+            "kind": "data-pack",
+            "packIndex": index,
+            "packCount": len(batches),
+            "fileCount": file_count,
+            "fileTotal": total_files,
+        }, ensure_ascii=False, indent=2) + "\n"
         if args.manifest_only:
             # Parallel HAP job: just report the layout; sizes are the raw
             # batch sizes (exact for store) and sha256 is deferred to the
@@ -191,13 +219,17 @@ def main() -> int:
         else:
             print("archiving %s ..." % name)
             with zipfile.ZipFile(str(archive), "w", compression, compresslevel=args.compress_level) as zf:
+                # Root-level in-pack manifest, BEFORE the payload entries so
+                # the importer can even find it in a truncated download.
+                zf.writestr("data-assets.json", pack_manifest)
                 for pack_id, files in batch:
                     for relative in files:
                         zf.write(str(root / relative), "data/" + relative)
             raw_size = sum((root / f).stat().st_size for pack_id, files in batch for f in files)
             size = archive.stat().st_size
             sha256 = sha256_file(archive)
-            print("asset %s: %d bytes (raw %d), packs=%s" % (name, size, raw_size, ",".join(p for p, _ in batch)))
+            print("asset %s: %d bytes (raw %d), packs=%s, files=%d" % (
+                name, size, raw_size, ",".join(p for p, _ in batch), file_count))
         assets.append({
             "name": name,
             "size": size,
@@ -205,6 +237,7 @@ def main() -> int:
             "rawSize": raw_size,
             "packs": [pack_id for pack_id, _ in batch],
             "fileCount": file_count,
+            "packIndex": index,
         })
 
     manifest = {
@@ -214,6 +247,10 @@ def main() -> int:
         "kind": "zip-parts",
         "assets": assets,
         "totalSize": total,
+        # Total number of files a COMPLETE dataset contains (every archive
+        # combined); legacy archives without an in-pack manifest fall back
+        # to comparing the extracted file count against this.
+        "fileTotal": total_files,
     }
     manifest_path = args.out / "data-assets.json"
     with manifest_path.open("w", encoding="utf-8", newline="\n") as handle:

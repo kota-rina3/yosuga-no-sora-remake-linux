@@ -11,7 +11,6 @@
 
 #import <UIKit/UIKit.h>
 #import <CommonCrypto/CommonDigest.h>
-#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 #include <string>
 #include <cstring>
@@ -83,10 +82,13 @@ static NSString *StagingPath(void)
 
 static BOOL GameDataReady(void)
 {
+    /* Same rule as Android / OHOS: the presence of data/startup.tjs alone
+     * means the dataset is launchable. The extra .complete marker (written
+     * only by the in-app download/import flow) used to block manually
+     * placed data from ever auto-starting the game. */
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *startup = [DataDirPath() stringByAppendingPathComponent:@"startup.tjs"];
-    NSString *marker = [DataRootPath() stringByAppendingPathComponent:@".complete"];
-    return [fm fileExistsAtPath:startup] && [fm fileExistsAtPath:marker];
+    return [fm fileExistsAtPath:startup];
 }
 
 /* Append a diagnostic line to Documents/<bundle>/bootstrap.log so a crash
@@ -172,6 +174,90 @@ static void MarkDataComplete(void)
 static void ClearDataComplete(void)
 {
     RemoveTree([DataRootPath() stringByAppendingPathComponent:@".complete"]);
+}
+
+/* ------------------------------------------------------------------ */
+/* In-pack manifest records (mirrors Android / OHOS importers)          */
+/* ------------------------------------------------------------------ */
+
+/* Every data archive ships its own data-assets.json at the zip ROOT
+ * (next to the data/ folder), written by package_data_release.py:
+ *   {"kind":"data-pack","packIndex":N,"packCount":M,
+ *    "fileCount":<files in this archive>,"fileTotal":<complete dataset>}
+ * After extracting an archive the importer renames that copy to
+ * data-assets-<packIndex>.json NEXT TO the data dir, so the completeness
+ * gate can name the exact archive numbers still missing. */
+
+static NSString *PackRecordPath(NSInteger index)
+{
+    return [DataRootPath() stringByAppendingPathComponent:
+        [NSString stringWithFormat:@"data-assets-%ld.json", (long)index]];
+}
+
+/* Archive numbers already recorded next to the data dir, ascending. */
+static NSArray<NSNumber *> *ListImportedPackIndexes(void)
+{
+    NSMutableArray<NSNumber *> *out = [NSMutableArray array];
+    NSArray *items = [[NSFileManager defaultManager]
+        contentsOfDirectoryAtPath:DataRootPath() error:nil];
+    for (NSString *name in items)
+    {
+        if (![name hasPrefix:@"data-assets-"] || ![name hasSuffix:@".json"])
+            continue;
+        NSString *numPart = [name substringWithRange:
+            NSMakeRange((NSUInteger)strlen("data-assets-"),
+                name.length - strlen("data-assets-") - strlen(".json"))];
+        NSNumberFormatter *fmt = [[NSNumberFormatter alloc] init];
+        fmt.numberStyle = NSNumberFormatterNoStyle;
+        fmt.usesGroupingSeparator = NO;
+        NSNumber *n = [fmt numberFromString:numPart];
+        if (n && n.integerValue > 0 &&
+            [n.stringValue isEqualToString:numPart] &&
+            ![out containsObject:n])
+            [out addObject:n];
+    }
+    [out sortUsingComparator:^NSComparisonResult(NSNumber *a, NSNumber *b) {
+        return [a compare:b];
+    }];
+    return out;
+}
+
+/* The release's total archive count: the highest packCount seen in THIS
+ * import round or inside any previously stored record. */
+static NSInteger ResolveImportPackCount(NSInteger observed)
+{
+    NSInteger best = observed;
+    for (NSNumber *n in ListImportedPackIndexes())
+    {
+        NSDictionary *pm = [NSJSONSerialization
+            JSONObjectWithData:[NSData dataWithContentsOfFile:PackRecordPath(n.integerValue)]
+            options:0 error:nil];
+        NSNumber *c = [pm isKindOfClass:NSDictionary.class] ? pm[@"packCount"] : nil;
+        if ([c isKindOfClass:NSNumber.class] && c.integerValue > best)
+            best = c.integerValue;
+    }
+    return best;
+}
+
+/* Recursive file count under a directory: the completeness yardstick for
+ * legacy archives without an in-pack manifest. */
+static long long CountFilesInDir(NSString *dir)
+{
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *items = [fm contentsOfDirectoryAtPath:dir error:nil];
+    if (!items)
+        return 0;
+    long long n = 0;
+    for (NSString *item in items)
+    {
+        NSString *child = [dir stringByAppendingPathComponent:item];
+        BOOL isDir = NO;
+        if ([fm fileExistsAtPath:child isDirectory:&isDir] && isDir)
+            n += CountFilesInDir(child);
+        else
+            n++;
+    }
+    return n;
 }
 
 /* Merge the staging tree into <root>/data: entries under staging/data are
@@ -275,6 +361,12 @@ static NSString *HexString(const unsigned char *bytes, size_t len)
 @property (nonatomic, assign) NSInteger chunksRemaining;
 @property (nonatomic, assign) BOOL chunkFailed;
 @property (nonatomic, copy) NSDictionary *activeTaskState;
+/* Download/extract pipeline: finished archives are handed to a SERIAL
+ * extract queue while the download loop keeps fetching the next asset. */
+@property (nonatomic, strong) dispatch_queue_t extractQueue;
+@property (nonatomic, assign) NSInteger extractedCount;
+@property (nonatomic, assign) BOOL allDownloadsDone;
+@property (nonatomic, assign) BOOL transferCancelled;
 @end
 
 @implementation TVPIOSBootstrapVC
@@ -296,6 +388,11 @@ static NSString *HexString(const unsigned char *bytes, size_t len)
     UIButton *_importButton;
     UILabel *_progressLabel;
     UIView *_progressFill;
+    /* Second (extract) progress bar: visible while an archive is being
+     * decompressed (serial queue), hidden again once extraction ends. */
+    UIImageView *_extractTrack;
+    UIView *_extractFill;
+    UILabel *_extractLabel;
     UIView *_container;
     BOOL _busy;
     BOOL _importPickerOpen;
@@ -307,6 +404,9 @@ static NSString *HexString(const unsigned char *bytes, size_t len)
     UIBackgroundTaskIdentifier _bgTask;
     NSInteger _selectedProxy;
     NSInteger _activeAction;
+    /* Highest packCount seen in any in-pack manifest of the CURRENT import
+     * round: the completeness gate needs it to name the missing archives. */
+    NSInteger _importPackCount;
 }
 
 - (BOOL)prefersStatusBarHidden { return YES; }
@@ -334,7 +434,7 @@ static NSString *HexString(const unsigned char *bytes, size_t len)
                 return baseUrl;
         }
     }
-    return @"https://github.com/shuimo0413/yosuga-no-sora-remake/releases/latest/download/";
+    return @"https://github.com/WarSkyGod/yosuga-no-sora-remake/releases/latest/download/";
 }
 
 - (NSString *)effectiveBaseUrl
@@ -468,6 +568,25 @@ static NSString *HexString(const unsigned char *bytes, size_t len)
     _progressFill.layer.cornerRadius = 9;
     _progressFill.hidden = YES;
     [_container addSubview:_progressFill];
+
+    /* Extract bar (green), stacked directly above the download bar:
+     * text at y=622..666, track at y=668..686 (download track y=690..716). */
+    _extractTrack = [self makeAssetView:@"progress_track"
+                                  frame:CGRectMake(210, 668, 1215, 18)];
+    _extractTrack.hidden = YES;
+    [_container addSubview:_extractTrack];
+    _extractFill = [[UIView alloc] initWithFrame:CGRectMake(214, 672, 0, 10)];
+    _extractFill.backgroundColor = [self colorFromHex:0x4CAF50];
+    _extractFill.layer.cornerRadius = 7;
+    _extractFill.hidden = YES;
+    [_container addSubview:_extractFill];
+    _extractLabel = [[UILabel alloc] initWithFrame:CGRectMake(210, 622, 1215, 44)];
+    _extractLabel.font = [UIFont systemFontOfSize:20];
+    _extractLabel.textColor = [UIColor colorWithWhite:0.85 alpha:1.0];
+    _extractLabel.textAlignment = NSTextAlignmentCenter;
+    _extractLabel.numberOfLines = 1;
+    _extractLabel.hidden = YES;
+    [_container addSubview:_extractLabel];
 
     _messageLabel = [[UILabel alloc] initWithFrame:CGRectMake(200, 580, 1520, 100)];
     _messageLabel.font = [UIFont systemFontOfSize:22];
@@ -735,6 +854,8 @@ static NSString *HexString(const unsigned char *bytes, size_t len)
         CGRect frame = _progressFill.frame;
         frame.size.width = 0;
         _progressFill.frame = frame;
+        // The transfer is over: make sure the extract bar is gone.
+        [self hideExtractProgress];
     }
 }
 
@@ -745,6 +866,28 @@ static NSString *HexString(const unsigned char *bytes, size_t len)
     CGRect frame = _progressFill.frame;
     frame.size.width = 1207.0 * clamped;
     _progressFill.frame = frame;
+}
+
+- (void)setExtractText:(NSString *)text progress:(float)progress
+{
+    _extractLabel.text = text;
+    _extractLabel.hidden = NO;
+    _extractTrack.hidden = NO;
+    _extractFill.hidden = NO;
+    CGFloat clamped = MAX(0.0, MIN(1.0, progress));
+    CGRect frame = _extractFill.frame;
+    frame.size.width = 1207.0 * clamped;
+    _extractFill.frame = frame;
+}
+
+- (void)hideExtractProgress
+{
+    _extractLabel.hidden = YES;
+    _extractTrack.hidden = YES;
+    _extractFill.hidden = YES;
+    CGRect frame = _extractFill.frame;
+    frame.size.width = 0;
+    _extractFill.frame = frame;
 }
 
 - (void)setMessage:(NSString *)message
@@ -801,6 +944,15 @@ static NSString *HexString(const unsigned char *bytes, size_t len)
         self->_assetIndex = 0;
         self->_doneBytes = 0;
         self->_totalBytes = 0;
+        /* Reset the download/extract pipeline state for this round. */
+        self->_extractedCount = 0;
+        self->_allDownloadsDone = NO;
+        self->_transferCancelled = NO;
+        if (!self->_extractQueue)
+        {
+            self->_extractQueue =
+                dispatch_queue_create("tvp.ios.bootstrap.extract", DISPATCH_QUEUE_SERIAL);
+        }
         self->_downloadStart = CFAbsoluteTimeGetCurrent();
         for (NSDictionary *a in assets)
         {
@@ -828,7 +980,15 @@ static NSString *HexString(const unsigned char *bytes, size_t len)
     NSArray *assets = self.assetList;
     if (self.assetIndex >= assets.count)
     {
-        [self dataInstalled];
+        /* Every archive is downloaded. If extraction has also caught up,
+         * finish; otherwise the serial extract queue calls dataInstalled
+         * once the last archive is merged. */
+        self->_allDownloadsDone = YES;
+        if (self->_extractedCount >= (NSInteger)assets.count)
+        {
+            [self hideExtractProgress];
+            [self dataInstalled];
+        }
         return;
     }
     NSDictionary *asset = assets[self.assetIndex];
@@ -1014,8 +1174,19 @@ static NSString *HexString(const unsigned char *bytes, size_t len)
         NSDictionary *st = self.activeTaskState;
         [self.chunkFile closeFile];
         self.chunkFile = nil;
-        [self verifyAndProcessAsset:st[@"tmp"] name:st[@"name"]
-            sha256:st[@"sha256"] assetSize:st[@"size"]];
+        /* Pipeline: hand the finished archive to the SERIAL extract queue
+         * and IMMEDIATELY keep downloading the next one - decompression no
+         * longer stalls the transfer. doneBytes advances when a download
+         * completes (the extract bar owns extraction progress). */
+        self.doneBytes += [st[@"size"] longLongValue];
+        self.assetIndex = self.assetIndex + 1;
+        self.activeTaskState = nil;
+        dispatch_async(self.extractQueue, ^{
+            if (self->_transferCancelled) return;
+            [self verifyAndProcessAsset:st[@"tmp"] name:st[@"name"]
+                sha256:st[@"sha256"] assetSize:st[@"size"]];
+        });
+        [self downloadNextAsset];
     }
 }
 
@@ -1045,33 +1216,37 @@ static NSString *HexString(const unsigned char *bytes, size_t len)
 - (void)verifyAndProcessAsset:(NSString *)tmp name:(NSString *)name
     sha256:(NSString *)sha256 assetSize:(NSNumber *)assetSize
 {
-    [self setProgressText:[NSString stringWithFormat:@"正在校验 %@", name] progress:0];
-    /* sha256 over ~1.5 GB must NOT run on the main thread: it blocks the
-     * run loop long enough for the iOS watchdog to kill the app (this was
-     * the ~40% crash). Verify and extract on a background queue. */
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        if (sha256.length > 0)
-        {
-            unsigned char digest[CC_SHA256_DIGEST_LENGTH];
-            NSString *hashErr = nil;
-            if (!SHA256OfFile(tmp, digest, &hashErr) ||
-                ![[HexString(digest, CC_SHA256_DIGEST_LENGTH)
-                    lowercaseString] isEqualToString:[sha256 lowercaseString]])
-            {
-                RemoveTree(tmp);
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    [self downloadFailed:@"下载校验失败（sha256 不匹配），请重试"];
-                });
-                return;
-            }
-        }
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self setProgressText:[NSString stringWithFormat:@"正在解压 %@", name] progress:0];
-            self.doneBytes += assetSize.longLongValue;
-        });
-        IosLog([NSString stringWithFormat:@"verified %@, extracting", name]);
-        [self processArchive:tmp name:name];
+    (void)assetSize;
+    /* Runs on the serial extract queue (one archive at a time, while the
+     * download loop keeps fetching). The heavy sha256 must stay off the
+     * main thread: it previously blocked the run loop long enough for the
+     * iOS watchdog to kill the app. */
+    if (self->_transferCancelled) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self setProgressText:[NSString stringWithFormat:@"正在校验 %@", name]
+                     progress:0];
     });
+    if (sha256.length > 0)
+    {
+        unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+        NSString *hashErr = nil;
+        if (!SHA256OfFile(tmp, digest, &hashErr) ||
+            ![[HexString(digest, CC_SHA256_DIGEST_LENGTH)
+                lowercaseString] isEqualToString:[sha256 lowercaseString]])
+        {
+            RemoveTree(tmp);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self downloadFailed:@"下载校验失败（sha256 不匹配），请重试"];
+            });
+            return;
+        }
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self setExtractText:[NSString stringWithFormat:@"正在解压 %@", name]
+                    progress:0];
+    });
+    IosLog([NSString stringWithFormat:@"verified %@, extracting", name]);
+    [self processArchive:tmp name:name];
 }
 
 /* The former single-stream downloadTask flow is superseded by the
@@ -1100,6 +1275,9 @@ static NSString *HexString(const unsigned char *bytes, size_t len)
 - (void)downloadFailed:(NSString *)message
 {
     IosLog([NSString stringWithFormat:@"FAILED: %@", message]);
+    /* Stop the pipeline: pending extract-queue jobs see this flag and bail
+     * out, and the extract bar disappears with the transfer. */
+    self->_transferCancelled = YES;
     NSDictionary *st = self.activeTaskState;
     if (st)
     {
@@ -1113,67 +1291,79 @@ static NSString *HexString(const unsigned char *bytes, size_t len)
     [self setBusy:NO];
 }
 
-/* extraction progress: throttled main-queue updates */
+/* extraction progress: throttled main-queue updates onto the extract bar */
 static int ExtractProgressCb(void *ctx, int done, int total, const char *nameUtf8)
 {
+    (void)nameUtf8;
     if (done % 40 != 0 && done != total)
         return 1;
     TVPIOSBootstrapVC *vc = (__bridge TVPIOSBootstrapVC *)ctx;
     NSString *text = [NSString stringWithFormat:
         @"正在解压：%d / %d 个文件", done, total];
+    float pct = total > 0 ? (float)done * 100.0f / (float)total : 0.0f;
     dispatch_async(dispatch_get_main_queue(), ^{
-        [vc setProgressText:text progress:0];
+        [vc setExtractText:text progress:pct];
     });
     return 1;
 }
 
 - (void)processArchive:(NSString *)path name:(NSString *)name
 {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        NSString *staging = StagingPath();
-        RemoveTree(staging);
-        EnsureDir(staging);
-        int rc = 0;
-        char err[512] = {0};
-        if ([name.lowercaseString hasSuffix:@".xp3"])
+    /* Runs on the serial extract queue: verify → extract → merge one
+     * archive at a time while the download loop keeps fetching the next
+     * asset. mergeOnMain hops to the main queue synchronously for the
+     * (cheap) tree moves. */
+    NSString *staging = StagingPath();
+    RemoveTree(staging);
+    EnsureDir(staging);
+    int rc = 0;
+    char err[512] = {0};
+    if ([name.lowercaseString hasSuffix:@".xp3"])
+    {
+        OHOSXp3ExtractResult xr;
+        memset(&xr, 0, sizeof(xr));
+        rc = OHOS_ExtractXp3(path.fileSystemRepresentation,
+            staging.fileSystemRepresentation, ExtractProgressCb,
+            (__bridge void *)self, &xr);
+        if (rc != 0)
+            snprintf(err, sizeof(err), "%s", xr.error);
+    }
+    else
+    {
+        rc = Krkr_ExtractZip(path.fileSystemRepresentation,
+            staging.fileSystemRepresentation, ExtractProgressCb,
+            (__bridge void *)self, err, sizeof(err));
+    }
+    NSString *errMsg = nil;
+    NSString *cErr = rc != 0 ? [NSString stringWithUTF8String:err] : nil;
+    BOOL ok = (rc == 0) && [self mergeOnMain:staging err:&errMsg];
+    IosLog([NSString stringWithFormat:@"extract %@ rc=%d cErr=%@ mergeErr=%@",
+        name, rc, cErr ?: @"", errMsg ?: @""]);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (ok)
         {
-            OHOSXp3ExtractResult xr;
-            memset(&xr, 0, sizeof(xr));
-            rc = OHOS_ExtractXp3(path.fileSystemRepresentation,
-                staging.fileSystemRepresentation, ExtractProgressCb,
-                (__bridge void *)self, &xr);
-            if (rc != 0)
-                snprintf(err, sizeof(err), "%s", xr.error);
+            RemoveTree(path);
+            RemoveTree(staging);
+            self->_extractedCount += 1;
+            if (self->_transferCancelled) return;
+            /* Pipeline finish line: the last archive is merged only when
+             * every download has also completed. */
+            if (self.allDownloadsDone &&
+                self->_extractedCount >= (NSInteger)self.assetList.count)
+            {
+                [self hideExtractProgress];
+                [self dataInstalled];
+            }
         }
         else
         {
-            rc = Krkr_ExtractZip(path.fileSystemRepresentation,
-                staging.fileSystemRepresentation, ExtractProgressCb,
-                (__bridge void *)self, err, sizeof(err));
+            RemoveTree(path);   /* downloaded/imported archive */
+            RemoveTree(staging); /* partial extraction tree */
+            NSString *detail = errMsg.length > 0 ? errMsg
+                : (cErr ?: @"");
+            [self downloadFailed:[NSString stringWithFormat:
+                @"解压失败（%@）：%@", name, detail]];
         }
-        NSString *errMsg = nil;
-        NSString *cErr = rc != 0 ? [NSString stringWithUTF8String:err] : nil;
-        BOOL ok = (rc == 0) && [self mergeOnMain:staging err:&errMsg];
-        IosLog([NSString stringWithFormat:@"extract %@ rc=%d cErr=%@ mergeErr=%@",
-            name, rc, cErr ?: @"", errMsg ?: @""]);
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (ok)
-            {
-                RemoveTree(path);
-                RemoveTree(staging);
-                self.assetIndex = self.assetIndex + 1;
-                [self downloadNextAsset];
-            }
-            else
-            {
-                RemoveTree(path);   /* downloaded/imported archive */
-                RemoveTree(staging); /* partial extraction tree */
-                NSString *detail = errMsg.length > 0 ? errMsg
-                    : (cErr ?: @"");
-                [self downloadFailed:[NSString stringWithFormat:
-                    @"解压失败（%@）：%@", name, detail]];
-            }
-        });
     });
 }
 
@@ -1197,8 +1387,217 @@ static int ExtractProgressCb(void *ctx, int done, int total, const char *nameUtf
     return ok;
 }
 
+/* Read the in-pack manifest an archive just dropped (zip-root
+ * data-assets.json) and record it as data-assets-<N>.json next to the
+ * data dir. A bare-tree merge moves the staging root INTO the data dir,
+ * so the manifest copy may live there instead. Runs on the import
+ * worker thread; UI updates hop to the main queue. */
+- (void)processPackManifestInStaging:(NSString *)staging
+{
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *src = [staging stringByAppendingPathComponent:@"data-assets.json"];
+    BOOL isDir = NO;
+    if (![fm fileExistsAtPath:src isDirectory:&isDir] || isDir)
+    {
+        /* not in the staging root - a bare-tree merge moved it into the
+         * data dir next to startup.tjs */
+        src = [DataDirPath() stringByAppendingPathComponent:@"data-assets.json"];
+        isDir = NO;
+        if (![fm fileExistsAtPath:src isDirectory:&isDir] || isDir)
+            return; /* legacy archive: no in-pack manifest */
+    }
+    NSDictionary *pm = [NSJSONSerialization
+        JSONObjectWithData:[NSData dataWithContentsOfFile:src]
+        options:0 error:nil];
+    NSInteger index = 0;
+    NSInteger count = 0;
+    if ([pm isKindOfClass:NSDictionary.class])
+    {
+        NSNumber *i = pm[@"packIndex"];
+        NSNumber *c = pm[@"packCount"];
+        if ([i isKindOfClass:NSNumber.class])
+            index = i.integerValue;
+        if ([c isKindOfClass:NSNumber.class])
+            count = c.integerValue;
+    }
+    if (index < 1)
+    {
+        RemoveTree(src); /* not a valid in-pack manifest: drop it */
+        return;
+    }
+    if (count > _importPackCount)
+        _importPackCount = count;
+    NSString *record = PackRecordPath(index);
+    if ([fm fileExistsAtPath:record])
+    {
+        IosLog([NSString stringWithFormat:@"pack %ld already imported", (long)index]);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self setMessage:[NSString stringWithFormat:
+                @"第 %ld 个压缩包已导入过，请导入其他压缩包", (long)index]];
+        });
+        RemoveTree(src); /* already recorded: drop the duplicate copy */
+        return;
+    }
+    RemoveTree(record);
+    NSError *cpErr = nil;
+    if (![fm copyItemAtPath:src toPath:record error:&cpErr])
+    {
+        IosLog([NSString stringWithFormat:@"pack manifest record failed: %@",
+            cpErr.localizedDescription]);
+        return; /* the gate treats this pack as missing; files stay merged */
+    }
+    RemoveTree(src);
+    IosLog([NSString stringWithFormat:@"pack %ld recorded (count=%ld)",
+        (long)index, (long)count]);
+}
+
+/* Total file count of a COMPLETE dataset, from the release manifest
+ * (its dedicated fileTotal field, or the summed per-asset fileCount on
+ * older releases). 0 when unavailable (offline etc.). */
+- (void)fetchFileTotal:(void (^)(long long))completion
+{
+    NSString *baseUrl = [self effectiveBaseUrl];
+    NSString *originalManifestUrl =
+        [baseUrl stringByAppendingString:@"data-assets.json"];
+    NSString *proxy = [self proxyPrefix];
+    NSString *manifestUrl = proxy.length > 0
+        ? [proxy stringByAppendingString:originalManifestUrl]
+        : originalManifestUrl;
+    [self fetchJson:manifestUrl completion:^(id json, NSString *error) {
+        if (!json || error.length > 0)
+        {
+            completion(0);
+            return;
+        }
+        NSNumber *total = json[@"fileTotal"];
+        if ([total isKindOfClass:NSNumber.class] && total.longLongValue > 0)
+        {
+            completion(total.longLongValue);
+            return;
+        }
+        long long sum = 0;
+        NSArray *assets = json[@"assets"];
+        for (NSDictionary *a in assets)
+        {
+            NSNumber *fc = a[@"fileCount"];
+            if ([fc isKindOfClass:NSNumber.class])
+                sum += fc.longLongValue;
+        }
+        completion(sum);
+    }];
+}
+
+/* Post-import completeness gate (mirrors Android / OHOS). Archives WITH
+ * an in-pack manifest are tracked through data-assets-<N>.json records
+ * next to the data dir: the game starts only once EVERY archive is in,
+ * and the user is told the exact missing numbers otherwise. Legacy
+ * archives fall back to startup.tjs presence and, best-effort, the
+ * release manifest's fileTotal vs the extracted file count. */
+- (void)finishImport
+{
+    NSArray<NSNumber *> *imported = ListImportedPackIndexes();
+    NSInteger packCount = ResolveImportPackCount(_importPackCount);
+    if (imported.count > 0 && packCount > 0)
+    {
+        if (imported.count >= (NSUInteger)packCount)
+        {
+            /* Every archive of the release is in: normal startup flow. */
+            [self dataInstalled];
+            return;
+        }
+        NSMutableString *missing = [NSMutableString string];
+        for (NSInteger n = 1; n <= packCount; n++)
+        {
+            if (![imported containsObject:@(n)])
+            {
+                if (missing.length > 0)
+                    [missing appendString:@"、"];
+                [missing appendFormat:@"%ld", (long)n];
+            }
+        }
+        [self setMessage:[NSString stringWithFormat:
+            @"数据包不完整：已导入 %lu/%ld 个压缩包，还需导入 %ld 个，编号：%@",
+            (unsigned long)imported.count, (long)packCount,
+            (long)(packCount - (NSInteger)imported.count), missing]];
+        [self setBusy:NO];
+        return;
+    }
+    /* No in-pack manifests: a legacy single complete pack or an old
+     * multi-part release. startup.tjs means the data is usable as-is. */
+    if ([[NSFileManager defaultManager] fileExistsAtPath:
+            [DataDirPath() stringByAppendingPathComponent:@"startup.tjs"]])
+    {
+        [self dataInstalled];
+        return;
+    }
+    [self setProgressText:@"正在核对数据完整性…" progress:0];
+    [self fetchFileTotal:^(long long fileTotal) {
+        if (fileTotal > 0)
+        {
+            long long have = CountFilesInDir(DataDirPath());
+            [self setMessage:[NSString stringWithFormat:
+                @"数据包不完整：已解压 %lld/%lld 个文件，请继续导入其余压缩包",
+                have, fileTotal]];
+        }
+        else
+        {
+            [self setMessage:@"数据包不完整（该压缩包不含导入进度信息），请继续导入其余压缩包"];
+        }
+        [self setBusy:NO];
+    }];
+}
+
+/* .nomedia markers for the media-library exclusion convention: the game
+ * asset tree and the save folder must never be published into a gallery
+ * app. Runs after a download/import completes AND when the app boots with
+ * pre-existing data (the folder may predate the marker). */
+static void EnsureNoMediaAll(void)
+{
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *root = DataRootPath();
+    if (!root) return;
+    NSString *dataDir = [root stringByAppendingPathComponent:@"data"];
+    NSString *saveDir = [root stringByAppendingPathComponent:@"savedata"];
+    if (![fm fileExistsAtPath:saveDir])
+    {
+        [fm createDirectoryAtPath:saveDir
+            withIntermediateDirectories:YES attributes:nil error:nil];
+    }
+    for (NSString *dir in [NSArray arrayWithObjects:root, dataDir, saveDir,
+                           nil])
+    {
+        BOOL isDir = NO;
+        if (![fm fileExistsAtPath:dir isDirectory:&isDir] || !isDir)
+            continue;
+        NSString *marker = [dir stringByAppendingPathComponent:@".nomedia"];
+        if (![fm fileExistsAtPath:marker])
+            [fm createFileAtPath:marker contents:[NSData data] attributes:nil];
+    }
+}
+
 - (void)dataInstalled
 {
+    /* The import-progress records (data-assets-<N>.json) have done their
+     * job once the dataset is complete: drop them (and any leftover
+     * in-pack manifest) so a re-import after an app UPDATE is not rejected
+     * with "already imported" - the records survive an update install
+     * because the app data folder is preserved. */
+    {
+        NSError *cleanupErr = nil;
+        NSArray *items = [[NSFileManager defaultManager]
+            contentsOfDirectoryAtPath:DataRootPath() error:&cleanupErr];
+        for (NSString *name in items)
+        {
+            if ([name isEqualToString:@"data-assets.json"] ||
+                ([name hasPrefix:@"data-assets-"] && [name hasSuffix:@".json"]))
+            {
+                [[NSFileManager defaultManager] removeItemAtPath:
+                    [DataRootPath() stringByAppendingPathComponent:name]
+                              error:nil];
+            }
+        }
+    }
+    EnsureNoMediaAll();
     MarkDataComplete();
     IosLog(@"data installed, engine starting");
     [self setMessage:@""];
@@ -1264,10 +1663,15 @@ static int ExtractProgressCb(void *ctx, int done, int total, const char *nameUtf
     _importPickerOpen = YES;
     [self updateActionArtwork];
     [self setMessage:@""];
-    NSArray *types = @[UTTypeZIP, UTTypeData];
+    /* The UniformTypeIdentifiers framework (UTTypeZIP / UTTypeData /
+     * initForOpeningContentTypes:) is iOS 14+; the deployment target is
+     * iOS 13, so use the classic UTI-string document picker, which works
+     * from iOS 8 through current releases. */
+    NSArray *types = @[@"public.zip-archive", @"public.data"];
     UIDocumentPickerViewController *picker =
         [[UIDocumentPickerViewController alloc]
-            initForOpeningContentTypes:types asCopy:YES];
+            initWithDocumentTypes:types
+                           inMode:UIDocumentPickerModeImport];
     picker.delegate = self;
     picker.allowsMultipleSelection = YES;
     [self presentViewController:picker animated:YES completion:nil];
@@ -1289,8 +1693,13 @@ static int ExtractProgressCb(void *ctx, int done, int total, const char *nameUtf
     [self setBusy:YES];
     [self setProgressText:@"正在导入，请稍等" progress:0];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        RemoveTree(DataDirPath()); /* whole-tree swap, replaces ANY previous data */
+        /* The release ships as SEVERAL independent archives, so imports
+         * must ACCUMULATE: never wipe the data dir here (the merge below
+         * overlays the new archive onto whatever earlier rounds brought).
+         * Only the completion marker is cleared until the completeness
+         * gate decides the data set is whole. */
         ClearDataComplete();
+        self->_importPackCount = 0;
         [self importArchives:urls];
     });
 }
@@ -1359,6 +1768,26 @@ static int ExtractProgressCb(void *ctx, int done, int total, const char *nameUtf
         BOOL ok = (rc == 0) && [self mergeOnMain:staging err:&mergeErr];
         IosLog([NSString stringWithFormat:@"import extract %@ rc=%d cErr=%@ mergeErr=%@",
             item[@"name"], rc, cErr ?: @"", mergeErr ?: @""]);
+        if (ok && [path.lowercaseString hasSuffix:@".xp3"])
+        {
+            /* data.xp3 is a COMPLETE dataset: finish right away instead of
+             * running the completeness gate (stale records from earlier
+             * multi-zip rounds would otherwise report missing packs). */
+            RemoveTree(staging);
+            RemoveTree(path);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self dataInstalled];
+            });
+            return;
+        }
+        if (ok)
+        {
+            /* Record the archive's in-pack manifest (zip-root
+             * data-assets.json) as data-assets-<N>.json next to the data
+             * dir, BEFORE the staging tree is removed. Re-imported packs
+             * only notify the user. */
+            [self processPackManifestInStaging:staging];
+        }
         RemoveTree(staging);
         RemoveTree(path);
         if (!ok)
@@ -1373,7 +1802,7 @@ static int ExtractProgressCb(void *ctx, int done, int total, const char *nameUtf
         }
     }
     dispatch_async(dispatch_get_main_queue(), ^{
-        [self dataInstalled];
+        [self finishImport];
     });
 }
 
@@ -1402,7 +1831,10 @@ int krkrsdl2_ios_run_bootstrap(void)
         }
         IosLog(@"bootstrap start");
         if (GameDataReady())
+        {
+            EnsureNoMediaAll();
             return 1;
+        }
         IosLog(@"showing bootstrap UI");
 
         TVPIOSBootstrapVC *vc = [[TVPIOSBootstrapVC alloc] init];

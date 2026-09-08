@@ -280,6 +280,124 @@ export function moveTreeTask(srcDir: string, dstDir: string): void {
 }
 
 /**
+ * TaskPool worker: MERGE a directory tree into a destination that already
+ * holds data from earlier import rounds. Unlike moveTreeTask it never
+ * deletes anything from the destination and never removes the source tree
+ * (the caller cleans the staging dir); same-name files are overwritten,
+ * which is exactly the semantics re-importing an archive needs. Progress
+ * is reported through <srcDir>.move.progress like moveTreeTask. Runs off
+ * the UI thread because the copy crosses volumes (sandbox -> public).
+ */
+@Concurrent
+export function mergeTreeTask(srcDir: string, dstDir: string): void {
+  const progressPath = srcDir + '.move.progress';
+  const writeProgress = (done: number, total: number): void => {
+    try {
+      const fd = fs.openSync(progressPath,
+        fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      fs.writeSync(fd.fd, done + ' ' + total);
+      fs.closeSync(fd);
+    } catch (e) {
+      // ignore
+    }
+  };
+
+  // Pass 1: count files for the progress denominator.
+  let total = 0;
+  const cStack: string[] = [''];
+  while (cStack.length > 0) {
+    const rel = cStack.pop();
+    if (rel === undefined) {
+      continue;
+    }
+    const src = srcDir + (rel === '' ? '' : '/' + rel);
+    let entries: string[] = [];
+    try {
+      entries = fs.listFileSync(src);
+    } catch (e) {
+      continue;
+    }
+    for (const name of entries) {
+      const s = src + '/' + name;
+      try {
+        if (fs.statSync(s).isDirectory()) {
+          cStack.push(rel === '' ? name : rel + '/' + name);
+        } else {
+          total++;
+        }
+      } catch (e) {
+        // ignore
+      }
+    }
+  }
+
+  // Pass 2: copy files over the existing tree (with progress). The source
+  // tree is left in place for the caller to remove.
+  let done = 0;
+  writeProgress(0, total);
+  const stack: string[] = [''];
+  while (stack.length > 0) {
+    const rel = stack.pop();
+    if (rel === undefined) {
+      continue;
+    }
+    const src = srcDir + (rel === '' ? '' : '/' + rel);
+    const dst = dstDir + (rel === '' ? '' : '/' + rel);
+    let entries: string[] = [];
+    try {
+      entries = fs.listFileSync(src);
+    } catch (e) {
+      continue;
+    }
+    try {
+      fs.mkdirSync(dst, true);
+    } catch (e) {
+      // may already exist
+    }
+    for (const name of entries) {
+      const s = src + '/' + name;
+      const d = dst + '/' + name;
+      let st: fs.Stat | null = null;
+      try {
+        st = fs.statSync(s);
+      } catch (e) {
+        continue;
+      }
+      if (st.isDirectory()) {
+        stack.push(rel === '' ? name : rel + '/' + name);
+      } else {
+        try {
+          fs.copyFileSync(s, d);
+        } catch (e) {
+          // a retry on the next launch picks it up
+          try {
+            const ef = fs.openSync(srcDir + '.move.err',
+              fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.APPEND);
+            fs.writeSync(ef.fd, d + ' | ' + JSON.stringify(e) + '\n');
+            fs.closeSync(ef);
+          } catch (e2) {
+            // ignore
+          }
+        }
+        done++;
+        if (done % 512 === 0 || done === total) {
+          writeProgress(done, total);
+        }
+      }
+    }
+  }
+  // Completion marker.
+  try {
+    const fd = fs.openSync(progressPath,
+      fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+    fs.writeSync(fd.fd, 'DONE');
+    fs.closeSync(fd);
+  } catch (e) {
+    // ignore
+  }
+}
+
+/**
  * TaskPool worker: delete a directory tree iteratively (no recursion:
  * @Concurrent functions may only reference imported or local variables).
  * Runs off the UI thread because leftover krkr_* video temp dirs can be

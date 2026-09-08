@@ -54,9 +54,13 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Enumeration;
 import java.util.List;
 import java.util.Locale;
+import java.util.TreeSet;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
@@ -119,6 +123,8 @@ public class BootstrapActivity extends Activity {
     private static final String TAG = "YosugaBootstrap";
     private static final String PREFS = "data_setup";
     private static final String KEY_CONFIRMED_VERSION = "confirmed_version";
+    /** Poison pill telling the extraction thread the download loop is done. */
+    private static final Object EXTRACT_DONE = new Object();
     // Injected at build time (gradle property defaultBaseUrl, set by CI from
     // the publishing repository). Local builds leave it empty: the download
     // field then requires the user to type the data-assets.json location.
@@ -129,6 +135,11 @@ public class BootstrapActivity extends Activity {
     private TextView progressView;
     private View progressFillView;
     private ImageView progressTrackView;
+    // Second (extract) progress bar: shown while an archive decompression
+    // runs (its own thread in the download pipeline), hidden when done.
+    private TextView extractTextView;
+    private View extractFillView;
+    private ImageView extractTrackView;
     private ImageView directLabelView;
     private ImageView ghProxyLabelView;
     private ImageView craftProxyLabelView;
@@ -314,6 +325,28 @@ public class BootstrapActivity extends Activity {
         progressFillView.setBackground(progressFill);
         progressFillView.setVisibility(View.GONE);
         canvas.addView(progressFillView, frame(0, 18, 214, 694));
+
+        // Extract progress bar (green), stacked directly above the download
+        // bar: text at y=622..666, track at y=668..686 (download track sits
+        // at y=690..716). Only visible while a decompression is running.
+        extractTrackView = makeAssetImage(R.drawable.progress_track);
+        extractTrackView.setVisibility(View.GONE);
+        canvas.addView(extractTrackView, frame(1215, 18, 210, 668));
+        extractFillView = new View(this);
+        GradientDrawable extractFill = new GradientDrawable();
+        extractFill.setColor(Color.rgb(76, 175, 80));
+        extractFill.setCornerRadius(7f);
+        extractFillView.setBackground(extractFill);
+        extractFillView.setVisibility(View.GONE);
+        canvas.addView(extractFillView, frame(0, 10, 214, 672));
+        extractTextView = new TextView(this);
+        extractTextView.setText("");
+        extractTextView.setTextSize(TypedValue.COMPLEX_UNIT_PX, 22f);
+        extractTextView.setTextColor(Color.rgb(200, 240, 200));
+        extractTextView.setGravity(android.view.Gravity.CENTER);
+        extractTextView.setBackgroundColor(Color.TRANSPARENT);
+        extractTextView.setVisibility(View.GONE);
+        canvas.addView(extractTextView, frame(1215, 44, 210, 622));
 
         // These fields are kept unattached so the downloader retains its
         // custom URL/proxy behaviour. They are exposed by long-pressing the
@@ -539,6 +572,34 @@ public class BootstrapActivity extends Activity {
         });
     }
 
+    /** Progress of the running decompression (own bar, shown until the
+     *  extraction finishes and hideExtractProgress() is called). */
+    private void setExtractProgress(String text, int percent) {
+        runOnUi(() -> {
+            extractTextView.setText(text);
+            extractTextView.setVisibility(View.VISIBLE);
+            extractTrackView.setVisibility(View.VISIBLE);
+            extractFillView.setVisibility(View.VISIBLE);
+            int clamped = Math.max(0, Math.min(100, percent));
+            FrameLayout.LayoutParams params =
+                    (FrameLayout.LayoutParams) extractFillView.getLayoutParams();
+            params.width = Math.round(1207f * clamped / 100f);
+            extractFillView.setLayoutParams(params);
+        });
+    }
+
+    private void hideExtractProgress() {
+        runOnUi(() -> {
+            extractTextView.setVisibility(View.GONE);
+            extractTrackView.setVisibility(View.GONE);
+            extractFillView.setVisibility(View.GONE);
+            FrameLayout.LayoutParams params =
+                    (FrameLayout.LayoutParams) extractFillView.getLayoutParams();
+            params.width = 0;
+            extractFillView.setLayoutParams(params);
+        });
+    }
+
     private void setMessage(String text) {
         runOnUi(() -> messageView.setText(text));
     }
@@ -562,6 +623,8 @@ public class BootstrapActivity extends Activity {
                         (FrameLayout.LayoutParams) progressFillView.getLayoutParams();
                 params.width = 0;
                 progressFillView.setLayoutParams(params);
+                // The transfer is over: make sure the extract bar is gone.
+                hideExtractProgress();
             }
             // Keep the screen ON while downloading / extracting so the
             // device does not go to sleep mid-transfer.
@@ -634,12 +697,17 @@ public class BootstrapActivity extends Activity {
         File parent = chooseDataParent();
         if (parent != null) {
             ensureNoMedia(parent);
+            // Pre-existing data (e.g. an app update kept the folder): mark
+            // the asset tree and the save folder for the media scanner too.
+            ensureNoMedia(new File(parent, "data"));
+            ensureNoMedia(new File(downloadRoot(), "savedata"));
         }
         maybeConfirmUpdate(ready);
     }
 
-    private void ensureNoMedia(File parent) {
-        File marker = new File(parent, ".nomedia");
+    private void ensureNoMedia(File dir) {
+        if (dir == null || !dir.isDirectory()) return;
+        File marker = new File(dir, ".nomedia");
         if (!marker.exists()) {
             try { marker.createNewFile(); } catch (IOException ignored) {}
         }
@@ -729,18 +797,77 @@ public class BootstrapActivity extends Activity {
                     for (String[] a : assets) total += Long.parseLong(a[2]);
                     long done = 0;
                     long startTime = System.currentTimeMillis();
+                    // Extraction pipeline: a dedicated thread pulls finished
+                    // archives off the queue while the download loop keeps
+                    // fetching the next one, so decompression no longer
+                    // stalls the transfer. The queue is tiny on purpose -
+                    // the disk then holds at most ~3 multi-GB zips.
+                    final java.util.concurrent.BlockingQueue<Object> extractQueue =
+                            new java.util.concurrent.ArrayBlockingQueue<>(2);
+                    final java.util.concurrent.atomic.AtomicReference<Exception>
+                            extractError = new java.util.concurrent.atomic.AtomicReference<>(null);
+                    final File extractDir = dataDir;
+                    final int packCount = assets.size();
+                    Thread extractor = new Thread(() -> {
+                        int seq = 0;
+                        while (true) {
+                            Object item;
+                            try {
+                                item = extractQueue.take();
+                            } catch (InterruptedException ie) {
+                                extractError.compareAndSet(null,
+                                        new IOException("解压线程被中断"));
+                                return;
+                            }
+                            if (item == EXTRACT_DONE) return;
+                            // Once extraction has failed, just drain the
+                            // queue so the producer never blocks forever.
+                            if (extractError.get() != null) continue;
+                            File zip = (File) item;
+                            seq++;
+                            try {
+                                extractZipTo(zip, extractDir,
+                                        "解压 " + zip.getName()
+                                                + "（" + seq + "/" + packCount + "）");
+                                zip.delete();
+                            } catch (Exception e) {
+                                extractError.compareAndSet(null, e);
+                            }
+                        }
+                    });
+                    extractor.start();
                     int index = 0;
-                    for (String[] asset : assets) {
-                        index++;
-                        String name = asset[0];
-                        String sha = asset[1];
-                        long size = Long.parseLong(asset[2]);
-                        File zip = new File(getCacheDir(), name);
-                        downloadFile(asset[3], zip, size, done, total, name, startTime);
-                        verifySha(zip, sha);
-                        extractZipTo(zip, dataDir, "解压 " + name);
-                        zip.delete();
-                        done += size;
+                    try {
+                        for (String[] asset : assets) {
+                            index++;
+                            // Stop pulling new archives once extraction has
+                            // failed; the wrap-up below reports the error.
+                            if (extractError.get() != null) break;
+                            String name = asset[0];
+                            String sha = asset[1];
+                            long size = Long.parseLong(asset[2]);
+                            File zip = new File(getCacheDir(), name);
+                            downloadFile(asset[3], zip, size, done, total, name, startTime);
+                            verifySha(zip, sha);
+                            extractQueue.put(zip);
+                            done += size;
+                        }
+                    } finally {
+                        try {
+                            extractQueue.put(EXTRACT_DONE);
+                        } catch (InterruptedException ie) {
+                            extractor.interrupt();
+                        }
+                        try {
+                            extractor.join();
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                        }
+                    }
+                    Exception ee = extractError.get();
+                    if (ee != null) {
+                        throw new IOException(
+                                ee.getMessage() == null ? "解压失败" : ee.getMessage(), ee);
                     }
                     installIntoDataDir(dataDir, parent);
                 } finally {
@@ -755,11 +882,9 @@ public class BootstrapActivity extends Activity {
         }).start();
     }
 
-    /** Returns [name, sha256, size, url] tuples. The accelerator proxy
-     * prefix (when set) is prepended to every asset URL, mirroring the
-     * OHOS downloader. */
-    private List<String[]> loadManifest() throws Exception {
-        List<String[]> out = new ArrayList<>();
+    /** The download root honoring the custom URL input; always ends with
+     * "/". Shared by the download flow and the import completeness check. */
+    private String resolveBaseUrl() {
         String base = baseUrlInput.getText().toString().trim();
         if (base.isEmpty()) {
             base = DEFAULT_BASE_URL;
@@ -768,6 +893,15 @@ public class BootstrapActivity extends Activity {
             }
         }
         if (!base.endsWith("/")) base += "/";
+        return base;
+    }
+
+    /** Returns [name, sha256, size, url] tuples. The accelerator proxy
+     * prefix (when set) is prepended to every asset URL, mirroring the
+     * OHOS downloader. */
+    private List<String[]> loadManifest() throws Exception {
+        List<String[]> out = new ArrayList<>();
+        String base = resolveBaseUrl();
         final String proxy = proxyInput.getText().toString().trim();
         String manifestUrl = proxy.isEmpty() ? (base + "data-assets.json")
                 : (proxy + base + "data-assets.json");
@@ -996,6 +1130,7 @@ public class BootstrapActivity extends Activity {
             String name = queryName(uri);
             String lower = name == null ? "" : name.toLowerCase(Locale.US);
             if (lower.endsWith(".xp3")) {
+                // data.xp3 is a COMPLETE dataset: import it alone (as before).
                 setProgress("正在导入 " + name, 0);
                 File xp3 = new File(parent, "data.xp3");
                 copyUri(uri, xp3);
@@ -1013,27 +1148,228 @@ public class BootstrapActivity extends Activity {
         }
         DataExtractService.start(this);
         try {
-            // Extract the zips STRAIGHT into the data directory (no staging
-            // dir, no cross-volume move).
+            // The release ships as SEVERAL INDEPENDENT zips, so imports must
+            // ACCUMULATE: extract straight into the data dir WITHOUT wiping
+            // it. Each archive carries its own data-assets.json at the zip
+            // root (next to the data/ folder); extractZipTo drops it into
+            // the data dir and processInPackManifest turns it into a
+            // data-assets-<packIndex>.json record next to the data dir so
+            // the completeness gate can name the missing archive numbers.
             File dataDir = new File(parent, "data");
-            if (dataDir.exists()) deleteTree(dataDir);
+            int[] packCount = {0};
             for (int i = 0; i < zips.size(); i++) {
                 String name = queryName(zips.get(i));
                 setProgress("正在解压 " + name + "（" + (i + 1) + "/" + zips.size() + "）",
                         i * 100 / zips.size());
                 File zip = new File(getCacheDir(), name);
                 copyUri(zips.get(i), zip);
+                // A leftover in-pack manifest (from a previous DOWNLOAD that
+                // drops it into the data dir, or an earlier archive of this
+                // round) must never leak into THIS round's records.
+                new File(dataDir, "data-assets.json").delete();
                 try {
                     extractZipTo(zip, dataDir, "解压 " + name);
                 } catch (IOException badZip) {
                     throw new IOException(name + " 不是有效的 zip 压缩包，请重新选择");
                 }
                 zip.delete();
+                processInPackManifest(dataDir, parent, packCount);
             }
-            installIntoDataDir(dataDir, parent);
+            finishImport(dataDir, parent, packCount[0]);
         } finally {
             DataExtractService.stop(this);
         }
+    }
+
+    /** Pick up the in-pack manifest an archive just dropped into the data
+     *  dir (zip-root data-assets.json, extracted NEXT to the data/... tree)
+     *  and record it as data-assets-<packIndex>.json next to the data dir.
+     *  Re-importing an archive that is already recorded only notifies the
+     *  user - the extracted files themselves overwrite harmlessly. */
+    private void processInPackManifest(File dataDir, File parent, int[] packCount)
+            throws IOException {
+        File packManifest = new File(dataDir, "data-assets.json");
+        if (!packManifest.isFile()) return; // legacy archive: no in-pack manifest
+        JSONObject pm = null;
+        try {
+            pm = new JSONObject(readText(packManifest));
+        } catch (Exception e) {
+            Log.w(TAG, "unreadable in-pack manifest", e);
+        }
+        if (pm == null) return; // leave it in place for a later attempt
+        int index = pm.optInt("packIndex", -1);
+        int count = pm.optInt("packCount", 0);
+        if (index < 1) {
+            packManifest.delete(); // not a valid in-pack manifest: drop it
+            return;
+        }
+        if (count > packCount[0]) packCount[0] = count;
+        File record = new File(parent, "data-assets-" + index + ".json");
+        if (record.isFile()) {
+            setMessage("第 " + index + " 个压缩包已导入过，请导入其他压缩包");
+            packManifest.delete(); // already recorded: drop the duplicate copy
+        } else {
+            if (!packManifest.renameTo(record)) {
+                copyFile(packManifest, record);
+                packManifest.delete();
+            }
+        }
+    }
+
+    /** Post-import completeness gate. Archives WITH an in-pack manifest are
+     *  tracked through data-assets-<N>.json records, so the importer can
+     *  tell the user the exact archive numbers still missing and only start
+     *  the game once EVERY archive is in. Legacy archives (no in-pack
+     *  manifest: single complete packs or old releases) fall back to
+     *  startup.tjs presence and, best-effort, the release manifest's
+     *  fileTotal vs the extracted file count. */
+    private void finishImport(File dataDir, File parent, int observedPackCount) throws IOException {
+        File innerXp3 = new File(dataDir, "data.xp3");
+        if (innerXp3.isFile()) {
+            // zip contained data.xp3: move it to the public root, then extract.
+            setProgress("正在复制 data.xp3 到下载目录…", 0);
+            File dst = new File(parent, "data.xp3");
+            dst.delete();
+            if (!innerXp3.renameTo(dst)) {
+                copyFile(innerXp3, dst);
+                innerXp3.delete();
+            }
+            deleteTree(dataDir);
+            extractXp3(dst);
+            return;
+        }
+        TreeSet<Integer> imported = listImportedPackIndexes(parent);
+        // The release size is ALSO stored inside every record, so a round
+        // where the user only re-picks an already-imported archive still
+        // knows the full pack count.
+        int packCount = resolveImportPackCount(parent, observedPackCount);
+        if (!imported.isEmpty() && packCount > 0) {
+            if (imported.size() >= packCount) {
+                // Every archive of the release is in: run the normal startup.
+                markConfirmed();
+                final File ready = dataDir;
+                runOnUi(() -> {
+                    if (dataReady(ready)) startEngine(ready);
+                    else fail("数据包已齐全但校验未通过，请重新导入");
+                });
+                return;
+            }
+            StringBuilder missing = new StringBuilder();
+            for (int n = 1; n <= packCount; n++) {
+                if (!imported.contains(n)) {
+                    if (missing.length() > 0) missing.append("、");
+                    missing.append(n);
+                }
+            }
+            final String message = "数据包不完整：已导入 " + imported.size() + "/" + packCount
+                    + " 个压缩包，还需导入 " + (packCount - imported.size())
+                    + " 个，编号：" + missing;
+            runOnUi(() -> setMessage(message));
+            return;
+        }
+        // No in-pack manifests anywhere: a legacy single complete pack or an
+        // old multi-part release. startup.tjs means the data is usable.
+        if (new File(dataDir, "startup.tjs").isFile()) {
+            markConfirmed();
+            final File ready = dataDir;
+            runOnUi(() -> {
+                if (dataReady(ready)) startEngine(ready);
+                else fail("数据安装后仍不可用，请重新导入");
+            });
+            return;
+        }
+        // Best-effort completeness hint from the release manifest.
+        long fileTotal = -1;
+        try {
+            fileTotal = fetchFileTotal();
+        } catch (Exception e) {
+            Log.w(TAG, "fileTotal lookup failed", e);
+        }
+        if (fileTotal > 0) {
+            final long have = countFiles(dataDir);
+            final long expected = fileTotal;
+            runOnUi(() -> setMessage("数据包不完整：已解压 " + have + "/" + expected
+                    + " 个文件，请继续导入其余压缩包"));
+        } else {
+            runOnUi(() -> setMessage("数据包不完整（该压缩包不含导入进度信息），请继续导入其余压缩包"));
+        }
+    }
+
+    /** Archive numbers already recorded next to the data dir, parsed from
+     *  the data-assets-<N>.json file names. */
+    private TreeSet<Integer> listImportedPackIndexes(File parent) {
+        TreeSet<Integer> out = new TreeSet<>();
+        Pattern pattern = Pattern.compile("data-assets-(\\d+)\\.json");
+        File[] children = parent.listFiles();
+        if (children == null) return out;
+        for (File f : children) {
+            Matcher m = pattern.matcher(f.getName());
+            if (m.matches()) {
+                try {
+                    out.add(Integer.parseInt(m.group(1)));
+                } catch (NumberFormatException ignored) {}
+            }
+        }
+        return out;
+    }
+
+    /** The release's total archive count: the highest packCount seen in
+     *  THIS import round or in any previously stored record. */
+    private int resolveImportPackCount(File parent, int observed) {
+        int best = observed;
+        for (int n : listImportedPackIndexes(parent)) {
+            try {
+                JSONObject pm = new JSONObject(readText(new File(parent, "data-assets-" + n + ".json")));
+                int c = pm.optInt("packCount", 0);
+                if (c > best) best = c;
+            } catch (Exception ignored) {}
+        }
+        return best;
+    }
+
+    /** Recursive file count under a directory: the completeness yardstick
+     *  for legacy archives without an in-pack manifest. */
+    private long countFiles(File dir) {
+        File[] children = dir.listFiles();
+        if (children == null) return 0;
+        long n = 0;
+        for (File f : children) {
+            if (f.isDirectory()) n += countFiles(f);
+            else n++;
+        }
+        return n;
+    }
+
+    /** Total number of files a COMPLETE dataset contains, from the release
+     *  manifest: its dedicated fileTotal field, or the summed per-asset
+     *  fileCount on older releases. -1 when unavailable (offline etc.). */
+    private long fetchFileTotal() throws Exception {
+        String base = resolveBaseUrl();
+        final String proxy = proxyInput.getText().toString().trim();
+        String manifestUrl = proxy.isEmpty() ? (base + "data-assets.json")
+                : (proxy + base + "data-assets.json");
+        HttpURLConnection conn = (HttpURLConnection) new URL(manifestUrl).openConnection();
+        conn.setConnectTimeout(20000);
+        conn.setReadTimeout(30000);
+        conn.setRequestProperty("User-Agent", "YosugaSoraHD/1.0");
+        StringBuilder sb = new StringBuilder();
+        try (BufferedReader r = new BufferedReader(new InputStreamReader(
+                conn.getInputStream(), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = r.readLine()) != null) sb.append(line).append('\n');
+        } finally {
+            conn.disconnect();
+        }
+        JSONObject rootObj = new JSONObject(sb.toString());
+        long total = rootObj.optLong("fileTotal", -1);
+        if (total > 0) return total;
+        JSONArray assets = rootObj.optJSONArray("assets");
+        if (assets == null) return -1;
+        long sum = 0;
+        for (int i = 0; i < assets.length(); i++) {
+            sum += assets.getJSONObject(i).optLong("fileCount", 0);
+        }
+        return sum > 0 ? sum : -1;
     }
 
     private String queryName(Uri uri) {
@@ -1088,7 +1424,7 @@ public class BootstrapActivity extends Activity {
                 }
                 done++;
                 if (done % 512 == 0 || done == total) {
-                    setProgress(label + "：" + done + " / " + total,
+                    setExtractProgress(label + "：" + done + " / " + total,
                             total > 0 ? done * 100 / total : 0);
                 }
             }
@@ -1148,6 +1484,36 @@ public class BootstrapActivity extends Activity {
     }
 
     private void markConfirmed() {
+        // The import-progress records (data-assets-<N>.json) have done their
+        // job once the dataset is complete: drop them (and any leftover
+        // in-pack manifest) so a re-import after an app UPDATE is not
+        // rejected with "第 N 个压缩包已导入过" - the records survive an
+        // update install because the app data folder is preserved.
+        try {
+            File parent = chooseDataParent();
+            if (parent != null) {
+                // Media-scan exclusion: game assets and saves must never be
+                // published into the system gallery. The save folder is
+                // created on demand so the marker exists before the first
+                // save (the engine writes its own marker on later boots).
+                File dataTree = new File(parent, "data");
+                if (!dataTree.isDirectory()) dataTree.mkdirs();
+                ensureNoMedia(dataTree);
+                File saveDir = new File(downloadRoot(), "savedata");
+                if (!saveDir.isDirectory()) saveDir.mkdirs();
+                ensureNoMedia(saveDir);
+                File[] kids = parent.listFiles();
+                if (kids != null) {
+                    Pattern rec = Pattern.compile("data-assets-(\\d+)\\.json");
+                    for (File f : kids) {
+                        String n = f.getName();
+                        if (n.equals("data-assets.json") || rec.matcher(n).matches()) {
+                            f.delete();
+                        }
+                    }
+                }
+            }
+        } catch (Exception ignored) {}
         try {
             getSharedPreferences(PREFS, MODE_PRIVATE).edit()
                     .putInt(KEY_CONFIRMED_VERSION, getVersionCode()).apply();
@@ -1163,7 +1529,7 @@ public class BootstrapActivity extends Activity {
         deleteTree(tmp);
         DataExtractService.start(this);
         try {
-            setProgress("正在解包 data.xp3…", 0);
+            setExtractProgress("正在解包 data.xp3…", 0);
             boolean started = nativeExtractXp3Start(xp3.getAbsolutePath(), tmp.getAbsolutePath());
             if (!started) throw new IOException("无法启动解包线程");
             while (true) {
@@ -1182,7 +1548,7 @@ public class BootstrapActivity extends Activity {
                         try {
                             int done = Integer.parseInt(parts[0]);
                             int total = Integer.parseInt(parts[1]);
-                            setProgress("正在解包 data.xp3：" + done + " / " + total,
+                            setExtractProgress("正在解包 data.xp3：" + done + " / " + total,
                                     total > 0 ? done * 100 / total : 0);
                         } catch (NumberFormatException ignored) {}
                     }

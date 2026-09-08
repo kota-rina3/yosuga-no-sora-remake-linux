@@ -6,7 +6,9 @@
  *    files instead of APK assets;
  *  - nativeExtractXp3Start runs the xp3 extractor on a worker thread and
  *    reports through <outDir>.status / <outDir>.progress (the Java side
- *    polls them, mirroring the OHOS flow).
+ *    polls them, mirroring the OHOS flow);
+ *  - nativeOnAudioFocusChange pauses/resumes the FAudio/SDL playback
+ *    device when another app (alarm, call, ...) takes the audio focus.
  */
 
 #include <jni.h>
@@ -16,6 +18,8 @@
 #include <cstring>
 #include <string>
 #include <thread>
+
+#include <SDL_audio.h>
 
 #include "AndroidDataBridge.h"
 #include "xp3_extract.h"
@@ -152,3 +156,98 @@ Java_com_shuimo0413_yosuganosora_hdremake_KirikiriSDL2Activity_nativeDetachExtra
 {
 	if (gExtractThread.joinable()) gExtractThread.detach();
 }
+
+// ---- Audio focus ----------------------------------------------------------
+// The Java side claims AUDIOFOCUS_GAIN and forwards focus changes here.
+// When the focus is lost (alarm, call, navigation, another player) the SDL
+// playback devices are paused; when AUDIOFOCUS_GAIN arrives they resume.
+// FAudio opens its SDL device through SDL_OpenAudioDevice, so the device id
+// is dynamic (>= 2, legacy SDL_PauseAudio targets id 1): scan the small
+// device-id space and remember exactly which devices WE paused, so the
+// resume never un-pauses a device that was already paused before us.
+namespace {
+std::atomic<bool> gFocusMuted{false};
+std::atomic<bool> gFocusDevices[8] = {};
+/* App lifecycle mute (background): mirrors the focus-loss logic but with a
+ * separate flag set so a background pause never collides with a real
+ * audio-focus loss (alarm/call while the app is already in background). */
+std::atomic<bool> gAppMuted{false};
+std::atomic<bool> gAppDevices[8] = {};
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_shuimo0413_yosuganosora_hdremake_KirikiriSDL2Activity_nativeOnAudioFocusChange(
+	JNIEnv *env, jclass clazz, jint change)
+{
+	(void)env;
+	(void)clazz;
+	// AudioManager.AUDIOFOCUS_GAIN == 1; every other change we care about
+	// (AUDIOFOCUS_LOSS, _LOSS_TRANSIENT, _LOSS_TRANSIENT_CAN_DUCK) mutes.
+	if (change == 1 /* AUDIOFOCUS_GAIN */)
+	{
+		if (gFocusMuted.exchange(false))
+		{
+			for (int slot = 0; slot < 8; ++slot)
+			{
+				if (gFocusDevices[slot].exchange(false))
+				{
+					SDL_PauseAudioDevice((SDL_AudioDeviceID)(slot + 2), 0);
+				}
+			}
+		}
+	}
+	else if (!gFocusMuted.exchange(true))
+	{
+		// IDs 2..9 cover every realistic SDL_OpenAudioDevice allocation in
+		// this app (FAudio owns the single playback device). Unknown ids
+		// report SDL_AUDIO_STOPPED and are skipped.
+		for (int slot = 0; slot < 8; ++slot)
+		{
+			SDL_AudioDeviceID id = (SDL_AudioDeviceID)(slot + 2);
+			if (SDL_GetAudioDeviceStatus(id) == SDL_AUDIO_PLAYING)
+			{
+				SDL_PauseAudioDevice(id, 1);
+				gFocusDevices[slot] = true;
+			}
+		}
+	}
+	}
+
+	// ---- App lifecycle (background) -------------------------------------------
+	// iOS suspends the FAudio engine when the app leaves the foreground so no
+	// BGM/SE keeps playing in the background (see FAudioDevice.cpp
+	// TVPIOSAudioSuspend/Resume).  Android mirrors that here with the same
+	// device-pause trick as the focus path but on an independent flag set.
+	extern "C" JNIEXPORT void JNICALL
+	Java_com_shuimo0413_yosuganosora_hdremake_KirikiriSDL2Activity_nativeOnAppBackground(
+		JNIEnv *env, jclass clazz)
+	{
+		(void)env;
+		(void)clazz;
+		if (gAppMuted.exchange(true)) return;
+		for (int slot = 0; slot < 8; ++slot)
+		{
+			SDL_AudioDeviceID id = (SDL_AudioDeviceID)(slot + 2);
+			if (SDL_GetAudioDeviceStatus(id) == SDL_AUDIO_PLAYING)
+			{
+				SDL_PauseAudioDevice(id, 1);
+				gAppDevices[slot] = true;
+			}
+		}
+	}
+
+	extern "C" JNIEXPORT void JNICALL
+	Java_com_shuimo0413_yosuganosora_hdremake_KirikiriSDL2Activity_nativeOnAppForeground(
+		JNIEnv *env, jclass clazz)
+	{
+		(void)env;
+		(void)clazz;
+		if (!gAppMuted.exchange(false)) return;
+		for (int slot = 0; slot < 8; ++slot)
+		{
+			if (gAppDevices[slot].exchange(false))
+			{
+				SDL_PauseAudioDevice((SDL_AudioDeviceID)(slot + 2), 0);
+			}
+		}
+	}

@@ -33,9 +33,124 @@
 #include <unistd.h>
 #include <ucontext.h>
 #include <dlfcn.h>
+#include <execinfo.h>
 
 /* Catch fatal signals, record a short backtrace into the sandbox
- * files dir (hdc-readable) for diagnosis, and exit cleanly. */
+ * files dir AND the user-readable Download app dir, and exit cleanly. */
+
+/* Walk the stack by scanning memory above RSP and keeping every word that
+ * resolves into a known module. backtrace() (unwinder) is NOT signal-safe on
+ * this system: it segfaulted inside our own handler, leaving only the
+ * handler's own frames in the report. */
+static void OHOS_WriteCrashReport(const char *path, int sig, siginfo_t *si, void *uc)
+{
+	if (!path || !path[0])
+		return;
+	FILE *lf = fopen(path, "a");
+	if (!lf)
+		return;
+	fprintf(lf, "===== CRASH signal=%d (%s) tid=%lu =====\n",
+		sig, strsignal(sig), (unsigned long)syscall(__NR_gettid));
+	if (si) fprintf(lf, "  fault addr = %p\n", si->si_addr);
+#if defined(__x86_64__)
+	/* musl x86_64 ucontext_t: uc_flags(+0) uc_link(+8) uc_stack(+16,24 bytes)
+	 * uc_mcontext(+40) = { gregs[23], ... } -> gregs[i] at uc+40+8*i.
+	 * glibc-compatible indices: REG_RSP=15, REG_RBP=10, REG_RIP=16. */
+	unsigned long rip = 0, rsp = 0, rbp = 0;
+	if (uc)
+	{
+		const unsigned char *b = (const unsigned char *)uc;
+		memcpy(&rip, b + 40 + 8 * 16, 8);
+		memcpy(&rsp, b + 40 + 8 * 15, 8);
+		memcpy(&rbp, b + 40 + 8 * 10, 8);
+	}
+	fprintf(lf, "  rip=%p rsp=%p rbp=%p\n", (void *)rip, (void *)rsp, (void *)rbp);
+	{
+		Dl_info info;
+		memset(&info, 0, sizeof(info));
+		if (rip && dladdr((void *)rip, &info) && info.dli_fname)
+			fprintf(lf, "  rip in: %s +0x%lx\n", info.dli_fname,
+				rip - (unsigned long)info.dli_fbase);
+		if (rbp > 0x10000 && rbp > rsp && rbp - rsp < 0x100000)
+		{
+			unsigned long retaddr = 0;
+			memcpy(&retaddr, (const void *)(rbp + 8), 8);
+			memset(&info, 0, sizeof(info));
+			if (retaddr && dladdr((void *)retaddr, &info) && info.dli_fname)
+				fprintf(lf, "  rbp+8 ->: %s +0x%lx\n", info.dli_fname,
+					retaddr - (unsigned long)info.dli_fbase);
+		}
+		/* Scan 512 words above RSP: every return address still on the stack
+		 * resolves into a module; older frames sit at higher addresses. */
+		if (rsp > 0x10000)
+		{
+			fprintf(lf, "  stack scan (module offsets, high->low):\n");
+			for (int i = 511; i >= 0; i--)
+			{
+				unsigned long v = 0;
+				const unsigned long *p = (const unsigned long *)(rsp + 8 * (unsigned long)i);
+				memcpy(&v, p, 8);
+				if (v < 0x10000)
+					continue;
+				memset(&info, 0, sizeof(info));
+				if (dladdr((const void *)v, &info) && info.dli_fname &&
+					info.dli_fname[0])
+				{
+					const char *base = info.dli_fname;
+					const char *slash = strrchr(base, '/');
+					if (slash) base = slash + 1;
+					fprintf(lf, "   +%04d %-24s +0x%lx\n", i, base,
+						v - (unsigned long)info.dli_fbase);
+				}
+			}
+		}
+	}
+#elif defined(__aarch64__)
+	if (uc)
+	{
+		const unsigned char *b = (const unsigned char *)uc;
+		unsigned long pc = 0, sp = 0, lr = 0;
+		memcpy(&pc, b + 440, 8);
+		memcpy(&sp, b + 432, 8);
+		memcpy(&lr, b + 424, 8); /* regs[30] = LR */
+		fprintf(lf, "  pc=%p sp=%p lr(x30)=%p\n",
+			(void *)pc, (void *)sp, (void *)lr);
+		Dl_info info;
+		memset(&info, 0, sizeof(info));
+		if (pc && dladdr((void *)pc, &info) && info.dli_fname)
+			fprintf(lf, "  pc in: %s +0x%lx\n", info.dli_fname,
+				pc - (unsigned long)info.dli_fbase);
+		if (lr && dladdr((void *)lr, &info) && info.dli_fname)
+			fprintf(lf, "  lr in: %s +0x%lx\n", info.dli_fname,
+				lr - (unsigned long)info.dli_fbase);
+		if (sp > 0x10000)
+		{
+			fprintf(lf, "  stack scan (module offsets, high->low):\n");
+			for (int i = 255; i >= 0; i--)
+			{
+				unsigned long v = 0;
+				const unsigned long *p = (const unsigned long *)(sp + 8 * (unsigned long)i);
+				memcpy(&v, p, 8);
+				if (v < 0x10000)
+					continue;
+				memset(&info, 0, sizeof(info));
+				if (dladdr((const void *)v, &info) && info.dli_fname &&
+					info.dli_fname[0])
+				{
+					const char *base = info.dli_fname;
+					const char *slash = strrchr(base, '/');
+					if (slash) base = slash + 1;
+					fprintf(lf, "   +%04d %-24s +0x%lx\n", i, base,
+						v - (unsigned long)info.dli_fbase);
+				}
+			}
+		}
+	}
+#endif
+	fflush(lf);
+	fclose(lf);
+}
+
 static void OHOS_CrashHandler(int sig, siginfo_t *si, void *uc)
 {
 	const char *sandbox = SDL_OHOS_GetFilesDir();
@@ -43,34 +158,18 @@ static void OHOS_CrashHandler(int sig, siginfo_t *si, void *uc)
 	{
 		char path[512];
 		snprintf(path, sizeof(path), "%s/crash.txt", sandbox);
-		FILE *lf = fopen(path, "a");
-		if (lf)
+		OHOS_WriteCrashReport(path, sig, si, uc);
+	}
+	/* The Download app dir is readable by the user (same place as
+	 * diag_fullscreen.log) - put a copy there so crashes can be reported
+	 * without shell access. */
+	{
+		const char *datadir = SDL_OHOS_GetDataDir();
+		if (datadir && datadir[0])
 		{
-			fprintf(lf, "===== CRASH signal=%d (%s) tid=%lu =====\n",
-				sig, strsignal(sig), (unsigned long)syscall(__NR_gettid));
-			if (si) fprintf(lf, "  fault addr = %p\n", si->si_addr);
-#if defined(__aarch64__)
-			if (uc)
-			{
-				const unsigned char *b = (const unsigned char *)uc;
-				unsigned long pc = 0, sp = 0, lr = 0;
-				memcpy(&pc, b + 440, 8);
-				memcpy(&sp, b + 432, 8);
-				memcpy(&lr, b + 424, 8); /* regs[30] = LR */
-				fprintf(lf, "  pc=%p sp=%p lr(x30)=%p\n",
-					(void *)pc, (void *)sp, (void *)lr);
-				Dl_info info;
-				memset(&info, 0, sizeof(info));
-				if (pc && dladdr((void *)pc, &info) && info.dli_fname)
-					fprintf(lf, "  pc in: %s +0x%lx\n", info.dli_fname,
-						(unsigned long)(pc - (unsigned long)info.dli_fbase));
-				if (lr && dladdr((void *)lr, &info) && info.dli_fname)
-					fprintf(lf, "  lr in: %s +0x%lx\n", info.dli_fname,
-						(unsigned long)(lr - (unsigned long)info.dli_fbase));
-			}
-#endif
-			fflush(lf);
-			fclose(lf);
+			char path[512];
+			snprintf(path, sizeof(path), "%s/krkr_fault.txt", datadir);
+			OHOS_WriteCrashReport(path, sig, si, uc);
 		}
 	}
 	_exit(128 + sig);
@@ -157,6 +256,11 @@ uint64_t g_surface_height = 0;
  * size itself stays at the game resolution (1920x1080). */
 uint64_t g_physical_width = 0;
 uint64_t g_physical_height = 0;
+/* Fullscreen/windowed switch state (the game settings menu, TJS
+ * Window.fullScreen) lives in SDL_ohosvideo.c inside libkrkrsdl2.so so the
+ * engine resolves the bridge within its own .so; this module reaches it via
+ * the exported SDL_OHOS_PollFullscreenRequest / SDL_OHOS_AckFullscreen
+ * dynamic symbols (see napi_init.cpp pollFullscreen/ackFullscreen). */
 bool g_window_ready = false;
 
 bool g_engine_started = false;
@@ -314,6 +418,37 @@ void *SDL_OHOS_GetNativeWindow(void)
 	void *window = static_cast<void *>(g_native_window);
 	pthread_mutex_unlock(&g_lock);
 	return window;
+}
+
+/* Frame-scoped surface acquisition: returns the native window with the
+ * lifecycle lock HELD, so a concurrent OnSurfaceDestroyed (UI thread)
+ * blocks until the frame's write completes instead of tearing the surface
+ * down mid-frame. The caller MUST pair this with
+ * SDL_OHOS_ReleaseNativeWindow() on every exit path.
+ *
+ * This closes the use-after-free window that crashed real devices on every
+ * window resize / surface rebuild (krkr_fault.txt: pc jumped to a wild
+ * address inside libace_compatible - heap corrupted by writes into an
+ * already-destroyed surface buffer; krkr_fault2.txt: pc=0 through a cleared
+ * callback). The old GetNativeWindow released the lock immediately, so the
+ * UI thread could destroy the surface while the render thread was still
+ * writing into it. OnSurfaceChanged shares g_lock, so a resize also waits
+ * for the frame boundary. */
+void *SDL_OHOS_AcquireNativeWindow(void)
+{
+	pthread_mutex_lock(&g_lock);
+	if (!g_window_ready)
+	{
+		pthread_mutex_unlock(&g_lock);
+		return nullptr;
+	}
+	/* lock intentionally held until SDL_OHOS_ReleaseNativeWindow */
+	return static_cast<void *>(g_native_window);
+}
+
+void SDL_OHOS_ReleaseNativeWindow(void)
+{
+	pthread_mutex_unlock(&g_lock);
 }
 
 int SDL_OHOS_GetSurfaceSize(int *width, int *height)

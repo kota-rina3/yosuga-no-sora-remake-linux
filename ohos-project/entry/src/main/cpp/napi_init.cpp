@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <string>
 #include <unistd.h>
+#include <sys/statvfs.h>
 
 #include <filemanagement/file_uri/oh_file_uri.h>
 
@@ -337,6 +338,115 @@ static napi_value IsEngineRunning(napi_env env, napi_callback_info info)
 	return result;
 }
 
+/* pollFullscreen(): the pending fullscreen/windowed switch requested by the
+ * game settings menu (HarmonyOS PC / 2-in-1 tablets). Returns -1 (none),
+ * 0 (windowed) or 1 (fullscreen); the shell applies window.setFullScreen
+ * and acknowledges with ackFullscreen(state). The state lives in
+ * libkrkrsdl2.so (SDL_ohosvideo.c); see sdl_ohos_bridge.h. */
+static napi_value PollFullscreen(napi_env env, napi_callback_info info)
+{
+	(void)info;
+	napi_value result;
+	napi_create_int32(env, SDL_OHOS_PollFullscreenRequest(), &result);
+	return result;
+}
+
+/* ackFullscreen(applied): confirm the shell applied window.setFullScreen
+ * (applied = 0 windowed / 1 fullscreen); clears the pending request and
+ * records the state that backs the engine's GetFullScreenMode. */
+static napi_value AckFullscreen(napi_env env, napi_callback_info info)
+{
+	size_t argc = 1;
+	napi_value args[1] = {nullptr};
+	napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+	int32_t applied = 0;
+	if (argc < 1 || napi_get_value_int32(env, args[0], &applied) != napi_ok)
+	{
+		return nullptr;
+	}
+	SDL_OHOS_AckFullscreen(applied);
+	return nullptr;
+}
+
+/* pollWindowSize(): consume a pending window-size request written by the
+ * engine's SetZoom (OHOS desktop "resolution" switch). Returns [w, h] when
+ * a request was pending, [] otherwise; the shell resizes the OS window to
+ * the returned px size via mainWindow.resize(px2vp(w), px2vp(h)). */
+static napi_value PollWindowSize(napi_env env, napi_callback_info info)
+{
+	(void)info;
+	napi_value result;
+	int w = 0;
+	int h = 0;
+	napi_create_array_with_length(env, 2, &result);
+	if (SDL_OHOS_PollWindowSizeRequest(&w, &h))
+	{
+		napi_value vw;
+		napi_value vh;
+		napi_create_int32(env, w, &vw);
+		napi_create_int32(env, h, &vh);
+		napi_set_element(env, result, 0, vw);
+		napi_set_element(env, result, 1, vh);
+	}
+	return result;
+}
+
+/* diagLog(line): append one diagnostic line to <data dir>/diag_fullscreen.log
+ * (see SDL_OHOS_DiagLog in SDL_ohosvideo.c). Used by the ArkTS shell to trace
+ * the fullscreen poll and the XComponent canvas size alongside the native
+ * side of the same chain. */
+static napi_value DiagLog(napi_env env, napi_callback_info info)
+{
+	size_t argc = 1;
+	napi_value args[1] = {nullptr};
+	napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+	size_t len = 0;
+	if (argc >= 1 &&
+		napi_get_value_string_utf8(env, args[0], nullptr, 0, &len) == napi_ok)
+	{
+		std::vector<char> text(len + 1, '\0');
+		size_t copied = 0;
+		if (napi_get_value_string_utf8(env, args[0], text.data(),
+			len + 1, &copied) == napi_ok)
+		{
+			SDL_OHOS_DiagLog(text.data());
+		}
+	}
+	return nullptr;
+}
+
+/* freeDiskSpace(path): available bytes on the filesystem holding path
+ * (statvfs), or -1 when the probe fails. ArkTS has no statfs at
+ * compileSdkVersion 12, so the write-path free-space check is bridged
+ * through here. */
+static napi_value FreeDiskSpace(napi_env env, napi_callback_info info)
+{
+	size_t argc = 1;
+	napi_value args[1] = {nullptr};
+	napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+	size_t len = 0;
+	double result = -1.0;
+	if (argc >= 1 &&
+		napi_get_value_string_utf8(env, args[0], nullptr, 0, &len) == napi_ok)
+	{
+		std::vector<char> text(len + 1, '\0');
+		size_t copied = 0;
+		if (napi_get_value_string_utf8(env, args[0], text.data(),
+			len + 1, &copied) == napi_ok)
+		{
+			struct statvfs st;
+			memset(&st, 0, sizeof(st));
+			if (statvfs(text.data(), &st) == 0)
+			{
+				result = (double)st.f_bavail * (double)st.f_bsize;
+			}
+		}
+	}
+	napi_value out = nullptr;
+	napi_create_double(env, result, &out);
+	return out;
+}
+
 /* ---- data.xp3 extraction ------------------------------------------------ */
 
 namespace {
@@ -531,6 +641,11 @@ static napi_value Init(napi_env env, napi_value exports)
 		{"setVideoSurfaceId", nullptr, SetVideoSurfaceId, nullptr, nullptr, nullptr, napi_default, nullptr},
 		{"isVideoPlaying", nullptr, IsVideoPlaying, nullptr, nullptr, nullptr, napi_default, nullptr},
 		{"isEngineRunning", nullptr, IsEngineRunning, nullptr, nullptr, nullptr, napi_default, nullptr},
+		{"pollFullscreen", nullptr, PollFullscreen, nullptr, nullptr, nullptr, napi_default, nullptr},
+		{"ackFullscreen", nullptr, AckFullscreen, nullptr, nullptr, nullptr, napi_default, nullptr},
+	{"pollWindowSize", nullptr, PollWindowSize, nullptr, nullptr, nullptr, napi_default, nullptr},
+		{"diagLog", nullptr, DiagLog, nullptr, nullptr, nullptr, napi_default, nullptr},
+		{"freeDiskSpace", nullptr, FreeDiskSpace, nullptr, nullptr, nullptr, napi_default, nullptr},
 		{"setSurfaceSize", nullptr, SetSurfaceSize, nullptr, nullptr, nullptr, napi_default, nullptr},
 		{"extractXp3Start", nullptr, ExtractXp3Start, nullptr, nullptr, nullptr, napi_default, nullptr},
 		{"uriToPath", nullptr, UriToPath, nullptr, nullptr, nullptr, napi_default, nullptr},
