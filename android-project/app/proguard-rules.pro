@@ -1,1 +1,0 @@
-../../external/SDL/android-project/app/proguard-rules.pro
