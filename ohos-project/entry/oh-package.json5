@@ -1,9 +1,0 @@
-{
-  "name": "entry",
-  "version": "1.0.0",
-  "description": "Yosuga no Sora: HD Remake entry module",
-  "main": "",
-  "author": "LightWinder",
-  "license": "MIT",
-  "dependencies": {}
-}

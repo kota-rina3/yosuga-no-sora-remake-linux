@@ -1,1 +1,0 @@
-# The ArkTS game shell is not obfuscated; the engine runs entirely in native code.
