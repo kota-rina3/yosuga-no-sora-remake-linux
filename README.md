@@ -28,6 +28,10 @@ Linux系统跨平台运行时为 Kirikiri SDL2 引擎的校医版分支 [kota-ri
 本项目仅支持Linux，适配amd64、arm64和龙架构。
 其他系统请访问上游仓库。
 
+## 运行截图
+
+<img width="1366" height="768" alt="yosuga-deepin" src="https://github.com/user-attachments/assets/e5f2e1e8-37c0-4e77-8ae3-16e2dd25295c" />
+
 ## 已知问题
 
 视频无法播放，只能删除`data/`目录下的`.mp4/`文件来规避。
