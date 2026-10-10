@@ -20,8 +20,7 @@ Linux系统跨平台运行时为 Kirikiri SDL2 引擎的校医版分支 [kota-ri
 ## 获取并运行二进制文件
 
 前往本项目的release获取二进制文件，并解压到游戏根目录。
-由于视频无法播放，运行前进入`data/`目录，删除`.mp4/`视频文件。
-删除后，给权限并运行`./yosuga_no_sora.架构名`即可游玩。
+给权限并运行`./yosuga_no_sora.架构名`即可游玩。
 
 ## 当前状态
 
@@ -32,6 +31,6 @@ Linux系统跨平台运行时为 Kirikiri SDL2 引擎的校医版分支 [kota-ri
 
 <img width="1366" height="768" alt="yosuga-deepin" src="https://github.com/user-attachments/assets/e5f2e1e8-37c0-4e77-8ae3-16e2dd25295c" />
 
-## 已知问题
+## 游玩时发现bug？
 
-视频无法播放，只能删除`data/`目录下的`.mp4/`文件来规避。
+若发现bug，请开issue反馈。
